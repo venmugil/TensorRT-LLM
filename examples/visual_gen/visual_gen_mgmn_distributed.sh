@@ -53,20 +53,20 @@ CONTAINER_IMAGE="${CONTAINER_IMAGE:-/path/to/tensorrt-llm.sqsh}"
 MOUNT_DIR="${MOUNT_DIR:-$HOME}"
 MOUNT_DEST="${MOUNT_DEST:-$HOME}"
 
-MODEL_PATH="${MODEL_PATH:-Wan-AI/Wan2.2-T2V-A14B-Diffusers}"
-PROMPT="${PROMPT:-A cat playing piano}"
-OUTPUT_PATH="${OUTPUT_PATH:-output.avi}"
+export MODEL_PATH="${MODEL_PATH:-Wan-AI/Wan2.2-T2V-A14B-Diffusers}"
+export PROMPT="${PROMPT:-A cat playing piano}"
+export OUTPUT_PATH="${OUTPUT_PATH:-output.avi}"
 
 # Generation parameters
-HEIGHT="${HEIGHT:-720}"
-WIDTH="${WIDTH:-1280}"
-NUM_FRAMES="${NUM_FRAMES:-81}"
-NUM_STEPS="${NUM_STEPS:-40}"
-ATTENTION_BACKEND="${ATTENTION_BACKEND:-FA4}"
+export HEIGHT="${HEIGHT:-720}"
+export WIDTH="${WIDTH:-1280}"
+export NUM_FRAMES="${NUM_FRAMES:-81}"
+export NUM_STEPS="${NUM_STEPS:-40}"
+export ATTENTION_BACKEND="${ATTENTION_BACKEND:-FA4}"
 
 # Parallelism
-CFG_SIZE="${CFG_SIZE:-2}"
-ULYSSES_SIZE="${ULYSSES_SIZE:-2}"
+export CFG_SIZE="${CFG_SIZE:-2}"
+export ULYSSES_SIZE="${ULYSSES_SIZE:-2}"
 
 # ---------------------------------------------------------------------------
 # Derived values — do not edit
@@ -89,10 +89,27 @@ if [ "${NUM_GPUS}" -ne "${EXPECTED_GPUS}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Generate a temporary worker config YAML from parallelism env vars.
+# This avoids enumerating individual parallelism flags in worker.py —
+# new parallelism dimensions only require updating VisualGenArgs, not worker.py.
+# ---------------------------------------------------------------------------
+
+WORKER_CONFIG=$(mktemp /tmp/visualgen_worker_XXXXXX.yml)
+trap 'rm -f "${WORKER_CONFIG}"' EXIT
+
+cat > "${WORKER_CONFIG}" << EOF
+parallel:
+  dit_cfg_size: ${CFG_SIZE}
+  dit_ulysses_size: ${ULYSSES_SIZE}
+EOF
+
+export WORKER_CONFIG
+
+# ---------------------------------------------------------------------------
 # Build the run command
 # ---------------------------------------------------------------------------
 
-RUN_CMD="python examples/visual_gen/visual_gen_wan_t2v.py \
+export RUN_CMD="python examples/visual_gen/visual_gen_wan_t2v.py \
         --model_path '${MODEL_PATH}' \
         --prompt '${PROMPT}' \
         --height ${HEIGHT} --width ${WIDTH} --num_frames ${NUM_FRAMES} \
@@ -111,4 +128,12 @@ srun -l \
     --container-image "${CONTAINER_IMAGE}" \
     --container-workdir "${PROJECT_DIR}" \
     --container-mounts=${MOUNT_DIR}:${MOUNT_DEST} \
-    sh -c "${RUN_CMD}"
+    sh -c '
+        if [ "${SLURM_PROCID}" -eq 0 ]; then
+            eval "${RUN_CMD}"
+        else
+            python3 -m tensorrt_llm.visual_gen.worker \
+                --model "${MODEL_PATH}" \
+                --config "${WORKER_CONFIG}"
+        fi
+    '

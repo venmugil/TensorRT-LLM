@@ -424,7 +424,10 @@ setup(
             'trtllm-eval=tensorrt_llm.commands.eval:main'
         ],
     },
-    scripts=['tensorrt_llm/llmapi/trtllm-llmapi-launch'],
+    scripts=[
+        'tensorrt_llm/llmapi/trtllm-llmapi-launch',
+        'tensorrt_llm/visual_gen/trtllm-visualgen-launch',
+    ],
     extras_require={
         "devel": devel_deps,
     },

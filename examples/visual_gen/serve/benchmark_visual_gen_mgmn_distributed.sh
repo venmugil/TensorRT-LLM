@@ -68,6 +68,10 @@ export SERVER_CONFIG="${SERVER_CONFIG:-${PROJECT_ROOT}/examples/visual_gen/serve
 export BACKEND="${BACKEND:-openai-videos}"
 export SERVER_PORT="${SERVER_PORT:-8000}"
 
+# Required by trtllm-visualgen-launch so rank > 0 workers know which model to load
+export VISUALGEN_MODEL="${MODEL}"
+export VISUALGEN_CONFIG="${SERVER_CONFIG}"
+
 # Generation defaults
 export SIZE="${SIZE:-1280x720}"
 export NUM_FRAMES="${NUM_FRAMES:-81}"
@@ -104,6 +108,10 @@ wait_for_server() {
 
     echo "Waiting for server at ${url} ..."
     while [ $elapsed -lt $max_wait ]; do
+        if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+            echo "ERROR: Server srun process (PID ${SERVER_PID}) exited prematurely." >&2
+            return 1
+        fi
         if curl -s -o /dev/null -w "%{http_code}" "$url" 2>/dev/null | grep -q "200"; then
             echo "Server is ready (took ${elapsed}s)"
             return 0
@@ -170,7 +178,7 @@ srun -l \
     --container-image "${CONTAINER_IMAGE}" \
     --container-workdir "${PROJECT_ROOT}" \
     --container-mounts=${MOUNT_DIR}:${MOUNT_DEST} \
-    sh -c 'eval "${SERVER_CMD}"' &
+    bash "${PROJECT_ROOT}/tensorrt_llm/visual_gen/trtllm-visualgen-launch" sh -c 'eval "${SERVER_CMD}"' &
 
 SERVER_PID=$!
 trap cleanup EXIT

@@ -1,0 +1,44 @@
+#!/bin/bash
+# Launcher wrapper for multi-node VisualGen distributed inference.
+#
+# Splits MPI/SLURM ranks so that:
+#   Rank 0  — runs the user's command (trtllm-serve or a user script).
+#   Rank >0 — runs the VisualGen worker (python -m tensorrt_llm.visual_gen.worker),
+#             which receives requests via torch.distributed broadcast from rank 0
+#             and never participates in HTTP serving.
+#
+# Required environment variables:
+#   VISUALGEN_MODEL   HuggingFace model ID or local path for the diffusion model.
+#   VISUALGEN_CONFIG  Path to a VisualGen YAML config file (parallel settings,
+#                     teacache, etc.).
+#
+# Usage:
+#   export VISUALGEN_MODEL="Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+#   export VISUALGEN_CONFIG="/path/to/wan.yml"
+#   srun ... trtllm-visualgen-launch trtllm-serve "$VISUALGEN_MODEL" --host 0.0.0.0 ...
+
+set -Eeo pipefail
+
+rank=${SLURM_PROCID:-${OMPI_COMM_WORLD_RANK:-${PMI_RANK:-${PMI_ID:-0}}}}
+
+log_stderr() { echo -e "\033[33m$@\033[0m" >&2; }
+log_stderr "trtllm-visualgen-launch: rank=${rank}"
+
+if [ -z "$rank" ] || [ "$rank" -eq 0 ]; then
+    log_stderr "Rank 0: running user command: $*"
+    exec "$@"
+else
+    if [ -z "${VISUALGEN_MODEL:-}" ]; then
+        echo "ERROR: VISUALGEN_MODEL must be set for rank > 0 VisualGen workers." >&2
+        exit 1
+    fi
+    if [ -z "${VISUALGEN_CONFIG:-}" ]; then
+        echo "ERROR: VISUALGEN_CONFIG must be set for rank > 0 VisualGen workers." >&2
+        exit 1
+    fi
+
+    worker_cmd="python3 -m tensorrt_llm.visual_gen.worker --model ${VISUALGEN_MODEL} --config ${VISUALGEN_CONFIG}"
+
+    log_stderr "Rank ${rank}: running worker: ${worker_cmd}"
+    exec sh -c "${worker_cmd}"
+fi
