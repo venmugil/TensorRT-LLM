@@ -209,8 +209,11 @@ def _run_attn2d_check(
     dtype = getattr(torch, dtype_name)
     P = R * C
     assert world_size == P
-    L_per = L // P
-    assert L_per * P == L, "v0 backend requires L divisible by cp_size"
+    # Per-rank cyclic shard length.  For L not divisible by P, ranks
+    # r < L%P get one extra token; the backend pads internally so all
+    # collectives stay uniform.
+    L_local = (L - rank + P - 1) // P  # ceil((L - rank) / P)
+    L_max = (L + P - 1) // P
     hidden = num_heads * head_dim
 
     torch.cuda.set_device(rank)
@@ -248,6 +251,7 @@ def _run_attn2d_check(
         q_local = q_full[cp_rank::P].contiguous()
         k_local = k_full[cp_rank::P].contiguous()
         v_local = v_full[cp_rank::P].contiguous()
+        assert q_local.shape[0] == L_local
 
         backend = Attn2DFlashInferAttention(
             layer_idx=0, num_heads=num_heads, head_dim=head_dim, num_kv_heads=num_kv_heads
@@ -255,25 +259,35 @@ def _run_attn2d_check(
 
         metadata = Attn2DFlashInferAttentionMetadata(
             max_num_requests=1,
-            max_num_tokens=L_per,
-            seq_lens=torch.tensor([L_per], dtype=torch.int32),
+            max_num_tokens=L_local,
+            seq_lens=torch.tensor([L_local], dtype=torch.int32),
             num_contexts=1,
             mapping=mapping,
+            total_input_lens=torch.tensor([L], dtype=torch.int32),
         )
         metadata.prepare()
         forward_args = AttentionForwardArgs(attention_mask=PredefinedAttentionMask.CAUSAL)
 
         out_local = backend.forward(q_local, k_local, v_local, metadata, forward_args=forward_args)
-        # out_local: [L_per, num_heads * head_dim]
+        # out_local: [L_local, num_heads * head_dim]
+        assert out_local.shape[0] == L_local
 
-        # All-gather every rank's output to enable a single-GPU comparison.
-        out_gathered = torch.empty(P, L_per, hidden, dtype=dtype, device=device)
-        dist.all_gather_into_tensor(out_gathered.view(-1), out_local.contiguous().view(-1))
+        # Pad to L_max for a uniform all_gather, then trim to real
+        # positions on rank 0.  Padding rows carry virtual positions
+        # >= L and are discarded by the position slice below.
+        if L_local < L_max:
+            pad = out_local.new_zeros(L_max - L_local, hidden)
+            out_local_padded = torch.cat([out_local, pad], dim=0)
+        else:
+            out_local_padded = out_local
+        out_gathered = torch.empty(P, L_max, hidden, dtype=dtype, device=device)
+        dist.all_gather_into_tensor(out_gathered.view(-1), out_local_padded.contiguous().view(-1))
 
         if rank == 0:
-            # gathered[p, i] is the token at absolute position p + i*P.
-            # Interleave back to position order: out_sorted[k=i*P+p] = gathered[p, i].
-            out_full = out_gathered.permute(1, 0, 2).reshape(L, hidden)
+            # gathered[r, i] is the token at absolute position r + i*P.
+            # Permute (P, L_max, hidden) -> (L_max, P, hidden) -> flat
+            # position order, then slice to L real positions.
+            out_full = out_gathered.permute(1, 0, 2).reshape(L_max * P, hidden)[:L]
             out_full = out_full.view(L, num_heads, head_dim)
 
             out_ref = _reference_full_causal_sdpa(
@@ -314,10 +328,18 @@ def _entrypoint(world_size, R, C, L, num_heads, num_kv_heads, head_dim, dtype_na
 #   (2, 4), (4, 2): Q-split s=2 and K-split s=2
 #   (2, 8), (8, 2): s=4 splits (skipped automatically if < 16 GPUs)
 #   (3, 2): coprime -> custom_mask fallback branch
+# L_extra coverage:
+#   0: L divisible by P (uniform shard sizes)
+#   1: L = L_base + 1 -> rank 0 has one extra token (uneven sharding,
+#      pad/trim path exercised; for the coprime (3,2) mesh this also
+#      pairs an uneven and an even rank in the K/V mesh-transpose)
 @pytest.mark.parametrize("R,C", [(2, 2), (2, 4), (4, 2), (2, 8), (8, 2), (3, 2)])
 @pytest.mark.parametrize("num_heads,num_kv_heads", [(4, 4), (8, 2)])
 @pytest.mark.parametrize("dtype_name", ["bfloat16"])
-def test_attn2d_flashinfer_matches_full_causal_sdpa(R, C, num_heads, num_kv_heads, dtype_name):
+@pytest.mark.parametrize("L_extra", [0, 1])
+def test_attn2d_flashinfer_matches_full_causal_sdpa(
+    R, C, num_heads, num_kv_heads, dtype_name, L_extra
+):
     """Backend output across R*C GPUs must match a single-GPU full-causal SDPA."""
     pytest.importorskip("flashinfer")
 
@@ -325,10 +347,11 @@ def test_attn2d_flashinfer_matches_full_causal_sdpa(R, C, num_heads, num_kv_head
     if torch.cuda.device_count() < P:
         pytest.skip(f"needs {P} CUDA devices, have {torch.cuda.device_count()}")
 
-    # Keep L small but >= a couple of P-blocks so the cyclic interleaving
-    # is exercised non-trivially.  s=4 splits need enough rows per
-    # sub-tensor to keep the kernel happy.
-    L = max(64, 8 * P)
+    # Pick an L_base that is >= 64 and exactly divisible by P, then add
+    # L_extra so we can sweep both the divisible and uneven cases.
+    L_base = max(64, 8 * P)
+    L_base = ((L_base + P - 1) // P) * P
+    L = L_base + L_extra
     head_dim = 64
     seed = 0x5EED
 

@@ -65,14 +65,22 @@ on the real rows, and the dummy output / LSE are sliced off.
 FA2/FA3 public APIs do not expose ``custom_mask`` (and a user-defined
 mask rules out FA4), so FlashInfer is the only optimized kernel option
 for the fallback path.  KV cache, generation phase, fused QKV, sparse /
-sliding-window masks, mixed-dtype quantization, and ragged shard sizes
-are out of scope for v0.  Inputs are assumed to be cyclic-sharded by
-the caller and every request's total length is assumed divisible by
-cp_size.
+sliding-window masks, and mixed-dtype quantization are out of scope for
+v0.  Inputs are assumed to be cyclic-sharded by the caller.
+
+For requests whose total length is not divisible by ``cp_size``, the
+backend pads each rank's local shard up to ``ceil(L_total / cp_size)``
+with zero rows so every collective stays uniform-shape.  Padding tokens
+land at absolute positions ``>= L_total``, so the causal mask
+``p_k <= p_q`` excludes them from every real-Q output (Q-split,
+K-split, and custom_mask paths all handle this naturally).  Padding Q
+outputs are sliced off at exit.  The total length is read from
+``metadata.total_input_lens``; if absent the backend assumes
+divisibility.
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional
 
 import flashinfer
 import torch
@@ -100,13 +108,44 @@ class Attn2DFlashInferAttentionMetadata(AttentionMetadata):
 
     Each rank receives a cyclic shard of every request's tokens:
     rank ``cp_rank`` owns positions ``{p: p % cp_size == cp_rank}``.
-    ``seq_lens`` is the per-request shard length on this rank; the
-    request's total length is recovered as ``seq_lens * cp_size`` under
-    the v0 divisibility assumption.
+    ``seq_lens`` is the per-request shard length on this rank.
+
+    ``total_input_lens`` is the per-request total length (same value on
+    every rank).  When ``L_total % cp_size != 0``, ranks ``r < L_total %
+    cp_size`` get one extra token; the backend pads every rank up to
+    ``ceil(L_total / cp_size)`` so all collectives stay uniform-shape
+    and the natural causal mask excludes padding positions (>= L_total)
+    from real-Q attention outputs.  Padding Q outputs are sliced off
+    at exit.
+
+    If ``total_input_lens`` is ``None``, the backend falls back to the
+    divisible-L assumption and ``L_total = seq_lens * cp_size``.
     """
+
+    total_input_lens: Optional[torch.Tensor] = None
 
     def prepare(self) -> None:
         super().prepare()
+
+    def update_attn2d_param(
+        self,
+        total_input_lens: Optional[List[int]],
+    ) -> None:
+        """Set per-request total input lengths for the ATTN2D backend.
+
+        Called from the model engine's prepare-inputs path once per
+        batch, alongside ``seq_lens`` (mirrors ``update_helix_param``).
+
+        Args:
+            total_input_lens: per-request total (un-sharded) input
+                length, one entry per request in the batch.  When
+                ``None`` (or omitted by the engine) the backend falls
+                back to the divisible-L assumption.
+        """
+        if total_input_lens is None:
+            self.total_input_lens = None
+            return
+        self.total_input_lens = torch.tensor(total_input_lens, dtype=torch.int32)
 
 
 def _redistribute_kv_to_row_major(
@@ -234,9 +273,18 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
         k = k.view(-1, H_kv, D)
         v = v.view(-1, H_kv, D)
 
+        seq_lens = metadata.seq_lens.tolist()
+        # Per-request total length (same on every rank).  When None, fall
+        # back to the divisibility assumption L_total = L_local * P.
+        if metadata.total_input_lens is not None:
+            total_lens = metadata.total_input_lens.tolist()
+        else:
+            total_lens = [local_len * P for local_len in seq_lens]
+        assert len(total_lens) == len(seq_lens)
+
         outputs = []
         offset = 0
-        for local_len in metadata.seq_lens.tolist():
+        for local_len, total_len in zip(seq_lens, total_lens):
             q_local = q[offset : offset + local_len]
             k_local = k[offset : offset + local_len]
             v_local = v[offset : offset + local_len]
@@ -246,6 +294,7 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
                     q_local,
                     k_local,
                     v_local,
+                    L_total=total_len,
                     R=R,
                     C=C,
                     P=P,
@@ -266,6 +315,7 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
         k: torch.Tensor,
         v: torch.Tensor,
         *,
+        L_total: int,
         R: int,
         C: int,
         P: int,
@@ -275,11 +325,34 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
         mapping,
         cp_pg,
     ) -> torch.Tensor:
-        """Process one request's cyclic shard. Returns [L_local, H_q, D]."""
+        """Process one request's cyclic shard. Returns [L_local, H_q, D].
+
+        ``L_total`` is the request's total (un-sharded) length.  When
+        ``L_total % P != 0``, ranks ``r < L_total % P`` already hold one
+        extra real token; the rest pad up to ``ceil(L_total / P)`` with
+        one zero row.  Padding rows take "virtual" positions ``>= L_total``
+        so the natural causal mask excludes them from real-Q outputs,
+        and we slice them off the final output below.
+        """
         L_local = q.shape[0]
+        L_local_padded = (L_total + P - 1) // P  # ceil(L_total / P)
+        pad_rows = L_local_padded - L_local
+        assert pad_rows in (0, 1), (
+            f"unexpected pad_rows={pad_rows} for L_total={L_total}, P={P}, "
+            f"L_local={L_local}; cyclic sharding can differ by at most 1."
+        )
         H_q, D = q.shape[1], q.shape[2]
         H_kv = k.shape[1]
         device = q.device
+
+        if pad_rows:
+            q = torch.cat([q, q.new_zeros(pad_rows, H_q, D)], dim=0)
+            k = torch.cat([k, k.new_zeros(pad_rows, H_kv, D)], dim=0)
+            v = torch.cat([v, v.new_zeros(pad_rows, H_kv, D)], dim=0)
+        # Below, ``L_local`` refers to the padded length; the original
+        # is preserved as ``L_local_unpadded`` for the final slice.
+        L_local_unpadded = L_local
+        L_local = L_local_padded
 
         # --- 1) Row-gather Q: [L_local, H_q, D] -> [L_q = C*L_local, H_q, D].
         if C > 1:
@@ -470,7 +543,9 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
             v_stack = o_recv.permute(1, 0, 2, 3).contiguous()
             s_stack = lse_recv.permute(1, 0, 2).contiguous()
             out_merged, _ = flashinfer.merge_states(v_stack, s_stack)
-            return out_merged
+            # Slice off padded rows: those carried virtual positions
+            # >= L_total and were ignored by the causal mask.
+            return out_merged[:L_local_unpadded]
 
         # C == 1: this rank's L_local tokens are already complete.
-        return output
+        return output[:L_local_unpadded]
