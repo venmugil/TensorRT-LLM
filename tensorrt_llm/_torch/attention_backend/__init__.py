@@ -17,9 +17,12 @@ __all__ = [
 ]
 
 if IS_FLASHINFER_AVAILABLE:
+    from .attn2d_flashinfer import (Attn2DFlashInferAttention,
+                                    Attn2DFlashInferAttentionMetadata)
     from .flashinfer import FlashInferAttention, FlashInferAttentionMetadata
     from .star_flashinfer import StarAttention, StarAttentionMetadata
     __all__ += [
+        "Attn2DFlashInferAttention", "Attn2DFlashInferAttentionMetadata",
         "FlashInferAttention", "FlashInferAttentionMetadata", "StarAttention",
         "StarAttentionMetadata"
     ]

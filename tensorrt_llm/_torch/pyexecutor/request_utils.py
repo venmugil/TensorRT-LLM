@@ -309,6 +309,30 @@ def partition_context_for_helix(
     return input_ids_this_rank, position_ids_this_rank, input_len, padding_len
 
 
+def partition_context_for_attention2d(
+    input_token_ids: List[int], cp_rank: int, cp_size: int
+) -> Tuple[List[int], List[int], int]:
+    """Partition context for Attention2D CP with token-level cyclic distribution.
+
+    Rank r owns tokens at absolute positions {r, r+P, r+2P, ...} where P = cp_size.
+    Per-rank shard sizes may differ by one (ranks [0, S % P) get ceil(S/P) tokens,
+    ranks [S % P, P) get floor(S/P)). Shape uniformity required by the row/col
+    all-gather is handled inside the attention layer, not here.
+
+    Args:
+        input_token_ids: List of input token IDs.
+        cp_rank: Current CP rank (flat, in [0, cp_size)).
+        cp_size: Total number of CP ranks (= row_size * col_size).
+
+    Returns:
+        Tuple of (input_ids_this_rank, position_ids_this_rank, input_len).
+    """
+    input_len = len(input_token_ids)
+    input_ids_this_rank = input_token_ids[cp_rank::cp_size]
+    position_ids_this_rank = list(range(cp_rank, input_len, cp_size))
+    return input_ids_this_rank, position_ids_this_rank, input_len
+
+
 def merge_requests_to_llm_requests(
     new_requests: List, exclude_last_generation_logits: bool
 ) -> List[LlmRequest]:
@@ -359,6 +383,47 @@ def merge_helix_requests(
     for req_item in new_requests:
         input_ids_this_rank, position_ids_this_rank, input_len, _ = partition_context_for_helix(
             req_item.request.input_token_ids, cp_rank, cp_size, tokens_per_block
+        )
+
+        req = executor_request_to_llm_request(
+            req_id=req_item.id,
+            executor_request=req_item.request,
+            child_req_ids=req_item.child_req_ids,
+            exclude_last_generation_logits=exclude_last_generation_logits,
+            input_token_ids=input_ids_this_rank,
+            position_ids=position_ids_this_rank,
+        )
+        req.total_input_len_cp = input_len
+        req.seqlen_this_rank_cp = len(input_ids_this_rank)
+        req_with_children.append(req)
+        if req.child_requests:
+            req_with_children.extend(req.child_requests)
+
+    return req_with_children
+
+
+def merge_attention2d_requests(
+    new_requests: List,
+    cp_rank: int,
+    cp_size: int,
+    exclude_last_generation_logits: bool,
+) -> List[LlmRequest]:
+    """Merge requests for Attention2D CP.
+
+    Args:
+        new_requests: List of RequestQueueItem objects.
+        cp_rank: Current CP rank (flat, in [0, cp_size)).
+        cp_size: Total number of CP ranks (= row_size * col_size).
+        exclude_last_generation_logits: Whether to exclude last generation logits.
+
+    Returns:
+        List of LlmRequest objects including child requests.
+    """
+    req_with_children = []
+
+    for req_item in new_requests:
+        input_ids_this_rank, position_ids_this_rank, input_len = partition_context_for_attention2d(
+            req_item.request.input_token_ids, cp_rank, cp_size
         )
 
         req = executor_request_to_llm_request(
@@ -494,6 +559,13 @@ def merge_requests(
                 cp_rank=cp_rank,
                 cp_size=cp_size,
                 tokens_per_block=cp_config["tokens_per_block"],
+                exclude_last_generation_logits=exclude_last_generation_logits,
+            )
+        elif cp_type == CpType.ATTN2D:
+            return merge_attention2d_requests(
+                new_requests,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
                 exclude_last_generation_logits=exclude_last_generation_logits,
             )
         else:

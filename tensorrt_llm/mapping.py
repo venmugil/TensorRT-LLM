@@ -31,6 +31,8 @@ class CpType(StrEnum):
     RING = "RING"
     # CP type for helix parallelism
     HELIX = "HELIX"
+    # CP type for Attention2D parallelism (generalized for causal LLM prefill)
+    ATTN2D = "ATTN2D"
 
 
 class MappingBase:
@@ -125,7 +127,7 @@ class MappingBase:
                 attn_tp_size = tp_size * cp_size
                 attn_cp_size = 1
             else:
-                # fallback to helix
+                # fallback to helix / Attn2D
                 attn_tp_size = tp_size
                 attn_cp_size = cp_size
 
@@ -139,6 +141,18 @@ class MappingBase:
             raise ValueError(
                 f"attn_cp_size must be 1 for now for ulysses, but got {attn_tp_size}, {attn_cp_size}."
             )
+
+        if cp_type == CpType.ATTN2D and cp_size > 1:
+            if cp_config is None or "row_size" not in cp_config or "col_size" not in cp_config:
+                raise ValueError(
+                    "ATTN2D cp_type requires 'row_size' and 'col_size' in cp_config."
+                )
+            row_size = cp_config["row_size"]
+            col_size = cp_config["col_size"]
+            if row_size * col_size != cp_size:
+                raise ValueError(
+                    f"ATTN2D row_size * col_size must equal cp_size, "
+                    f"but got {row_size} * {col_size} != {cp_size}.")
 
         if tp_size * pp_size * cp_size != world_size:
             raise ValueError(
@@ -167,7 +181,8 @@ class MappingBase:
                 f"but got {tp_size} * {cp_size} != {attn_tp_size} * {attn_cp_size}"
             )
 
-        if moe_ep_size != 1 and cp_size > 1 and cp_type != CpType.HELIX:
+        if moe_ep_size != 1 and cp_size > 1 and cp_type not in (CpType.HELIX,
+                                                                CpType.ATTN2D):
             raise NotImplementedError(
                 f"CP {cp_type} doesn't support MoE tp/ep yet")
 
@@ -302,6 +317,60 @@ class MappingBase:
     def has_cp_helix(self):
         return self.cp_size > 1 and self.cp_config.get(
             "cp_type") == CpType.HELIX
+
+    def has_cp_attn2d(self):
+        return self.cp_size > 1 and self.cp_config.get(
+            "cp_type") == CpType.ATTN2D
+
+    @property
+    def attn2d_row_size(self) -> int:
+        """Row dim of the ATTN2D 2D mesh (R)."""
+        assert self.has_cp_attn2d()
+        return self.cp_config["row_size"]
+
+    @property
+    def attn2d_col_size(self) -> int:
+        """Col dim of the ATTN2D 2D mesh (C). Note R * C == cp_size."""
+        assert self.has_cp_attn2d()
+        return self.cp_config["col_size"]
+
+    @property
+    def attn2d_row_rank(self) -> int:
+        """This rank's row index in the ATTN2D mesh (column-major: row = cp_rank % R)."""
+        assert self.has_cp_attn2d()
+        return self.cp_rank % self.attn2d_row_size
+
+    @property
+    def attn2d_col_rank(self) -> int:
+        """This rank's col index in the ATTN2D mesh (column-major: col = cp_rank // R)."""
+        assert self.has_cp_attn2d()
+        return self.cp_rank // self.attn2d_row_size
+
+    @property
+    def attn2d_row_group(self) -> List[int]:
+        """Global ranks in the same row as this rank (same row, varying col).
+
+        Q is all-gathered across this group; partial attention outputs are also
+        merged (LSE) across this group.
+        """
+        assert self.has_cp_attn2d()
+        R = self.attn2d_row_size
+        C = self.attn2d_col_size
+        row_rank = self.attn2d_row_rank
+        cp_group = self.cp_group
+        return [cp_group[row_rank + k * R] for k in range(C)]
+
+    @property
+    def attn2d_col_group(self) -> List[int]:
+        """Global ranks in the same col as this rank (same col, varying row).
+
+        K and V are all-gathered across this group.
+        """
+        assert self.has_cp_attn2d()
+        R = self.attn2d_row_size
+        col_rank = self.attn2d_col_rank
+        cp_group = self.cp_group
+        return [cp_group[col_rank * R + k] for k in range(R)]
 
     def get_node_rank(self, rank: int):
         return rank // self.gpus_per_node
@@ -633,6 +702,14 @@ class Mapping(MappingBase):
     @property
     def moe_ep_group_pg(self) -> ProcessGroup:
         raise NotImplementedError("moe_ep_group_pg is not implemented.")
+
+    @property
+    def attn2d_row_group_pg(self) -> ProcessGroup:
+        raise NotImplementedError("attn2d_row_group_pg is not implemented.")
+
+    @property
+    def attn2d_col_group_pg(self) -> ProcessGroup:
+        raise NotImplementedError("attn2d_col_group_pg is not implemented.")
 
     def build_mesh(self):
         raise NotImplementedError("build_mesh is not implemented.")

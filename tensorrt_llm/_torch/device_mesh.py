@@ -44,6 +44,7 @@ class SingleProcessGroup:
 class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
     device_mesh = None
     tp_mesh = None
+    cp_mesh = None
 
     # Access Torch ProcessGroup
     @property
@@ -70,6 +71,22 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
     @require_device_mesh
     def moe_ep_group_pg(self) -> ProcessGroup:
         return self._get_mesh_dim_by_name('moe_ep').get_group()
+
+    # ATTN2D row/col groups: cp is split into [attn2d_col_idx, attn2d_row_idx]
+    # (column-major: row is fastest-varying within cp_rank). Membership in the
+    # "row group" means same row index / varying col index, so the PG is the
+    # mesh dim along which col_idx varies, i.e. "attn2d_col_idx".
+    @property
+    @require_device_mesh
+    def attn2d_row_group_pg(self) -> ProcessGroup:
+        assert self.has_cp_attn2d()
+        return self._get_mesh_dim_by_name('attn2d_col_idx').get_group()
+
+    @property
+    @require_device_mesh
+    def attn2d_col_group_pg(self) -> ProcessGroup:
+        assert self.has_cp_attn2d()
+        return self._get_mesh_dim_by_name('attn2d_row_idx').get_group()
 
     # Access rank
     @property
@@ -130,8 +147,14 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
             dims += ["tp"]
             shape += [self.tp_size]
 
-        dims += ["cp"]
-        shape += [self.cp_size]
+        if self.has_cp_attn2d():
+            # Split cp into a 2D mesh; column-major means row is the fastest-varying
+            # index, so attn2d_col_idx is outer (size C) and attn2d_row_idx is inner (size R).
+            dims += ["attn2d_col_idx", "attn2d_row_idx"]
+            shape += [self.attn2d_col_size, self.attn2d_row_size]
+        else:
+            dims += ["cp"]
+            shape += [self.cp_size]
 
         cls.device_mesh = init_device_mesh(
             "cuda",
@@ -142,8 +165,13 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
         if self.moe_ep_size > 1:
             cls.tp_mesh = cls.device_mesh["moe_tp",
                                           "moe_ep"]._flatten(mesh_dim_name="tp")
+        if self.has_cp_attn2d():
+            cls.cp_mesh = cls.device_mesh["attn2d_col_idx",
+                                          "attn2d_row_idx"]._flatten(
+                                              mesh_dim_name="cp")
         logger.debug(f"DeviceMeshTopology.device_mesh: {cls.device_mesh}")
         logger.debug(f"DeviceMeshTopology.tp_mesh: {cls.tp_mesh}")
+        logger.debug(f"DeviceMeshTopology.cp_mesh: {cls.cp_mesh}")
 
     @require_device_mesh
     @torch.compiler.disable
@@ -158,6 +186,11 @@ class DeviceMeshTopologyImpl(_MappingBaseForTypeCheck):
                 return cls.device_mesh['tp']
             else:
                 return cls.tp_mesh
+        elif name == 'cp':
+            if 'cp' in cls.device_mesh.mesh_dim_names:
+                return cls.device_mesh['cp']
+            else:
+                return cls.cp_mesh
         else:
             assert name in cls.device_mesh.mesh_dim_names, f"Dimension name {name} not found in device mesh."
             return cls.device_mesh[name]
