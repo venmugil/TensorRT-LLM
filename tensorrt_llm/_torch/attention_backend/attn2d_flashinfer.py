@@ -78,6 +78,11 @@ import flashinfer
 import torch
 import torch.distributed as dist
 
+from tensorrt_llm._torch.distributed import (
+    attn2d_col_allgather,
+    attn2d_row_allgather,
+    attn2d_row_alltoall,
+)
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from .interface import (
@@ -134,14 +139,14 @@ def _redistribute_kv_to_row_major(
     involution; ``source = (r%R)*C + (r//R)`` is the inverse of
     ``target = (r%C)*R + (r//C)``.
 
-    Returning a packed tensor (rather than the unpacked (k, v) pair) lets
-    the caller feed the result directly into the col-gather's
-    all_gather_into_tensor, saving the unpack-then-repack copies that
-    would otherwise sandwich the collective.
-
     No-op cases (caller's kv returned unchanged) include ``C == 1`` and
     main-diagonal ranks (``col_idx == row_idx`` for ``R == C``); both
     fall out of the ``target == cp_rank`` test.
+
+    Note: this is the only remaining call in the backend that needs a
+    torch ProcessGroup (``cp_pg``).  When a ``torch.ops.trtllm.permute_
+    send_recv`` op exists, this function can be replaced by a wrapper
+    keyed on ``mapping.cp_group`` so MPI-mode runs work without a PG.
     """
     target = (cp_rank % C) * R + (cp_rank // C)
     if target == cp_rank:
@@ -216,8 +221,9 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
         cp_rank = mapping.cp_rank
         row_idx = mapping.attn2d_row_rank
         col_idx = mapping.attn2d_col_rank
-        row_pg = mapping.attn2d_row_group_pg
-        col_pg = mapping.attn2d_col_group_pg
+        # cp_pg is still required for the K/V mesh-transpose swap below;
+        # the row/col collectives now go through wrappers that pick MPI
+        # vs PG mode internally and only need ``mapping``.
         cp_pg = mapping.cp_group_pg
 
         H_q = self.num_heads
@@ -246,8 +252,7 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
                     cp_rank=cp_rank,
                     row_idx=row_idx,
                     col_idx=col_idx,
-                    row_pg=row_pg,
-                    col_pg=col_pg,
+                    mapping=mapping,
                     cp_pg=cp_pg,
                 )
             )
@@ -267,8 +272,7 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
         cp_rank: int,
         row_idx: int,
         col_idx: int,
-        row_pg,
-        col_pg,
+        mapping,
         cp_pg,
     ) -> torch.Tensor:
         """Process one request's cyclic shard. Returns [L_local, H_q, D]."""
@@ -279,33 +283,26 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
 
         # --- 1) Row-gather Q: [L_local, H_q, D] -> [L_q = C*L_local, H_q, D].
         if C > 1:
-            q_recv = q.new_empty(C, L_local, H_q, D)
-            dist.all_gather_into_tensor(q_recv.view(-1), q.contiguous().view(-1), group=row_pg)
-            q_full = q_recv.reshape(C * L_local, H_q, D)
+            q_full = attn2d_row_allgather(q.contiguous(), mapping, dim=0)
         else:
             q_full = q
 
-        # --- 2 + 3) Redistribute K/V (column-major -> row-major cyclic)
-        # and col-gather, keeping K/V packed end-to-end so no
-        # unpack/re-pack copies straddle the collectives.  The result is
-        # kv_recv in source-rank-grouped layout (R, 2, L_local, H_kv, D);
-        # path-specific re-layouts happen in step 4 below.
+        # --- 2-3) Redistribute K/V (column-major -> row-major cyclic) and
+        # col-gather, packed end-to-end.  Result is source-rank-grouped
+        # K/V; step 4 re-layouts per path.
         L_q = C * L_local
         L_k = R * L_local
 
         if R > 1:
-            # Pack once.  The packed buffer flows through redistribute
-            # (which may P2P-swap it with another rank) and is fed
-            # directly to all_gather_into_tensor.
             kv_send = torch.stack([k, v], dim=0).contiguous()
             kv_send = _redistribute_kv_to_row_major(kv_send, R=R, C=C, cp_rank=cp_rank, cp_pg=cp_pg)
-            kv_recv = k.new_empty(R, 2, L_local, H_kv, D)
-            dist.all_gather_into_tensor(kv_recv.view(-1), kv_send.view(-1), group=col_pg)
-        # else (R == 1): no redistribute, no col-gather.  This rank
-        # already holds K/V at positions {col_idx, col_idx+P, col_idx+2P,
-        # ...} in ascending order, so k / v *are* the sorted tensors.
-        # The Q-split branch (R == 1 always satisfies C % R == 0) uses
-        # them directly.
+            # attn2d_col_allgather concatenates along dim 0; output is
+            # rank-major, so .view(R, 2, ...) yields the same layout that
+            # all_gather_into_tensor into a (R, 2, L_local, H_kv, D) buffer
+            # would have produced.
+            kv_recv = attn2d_col_allgather(kv_send, mapping, dim=0).view(R, 2, L_local, H_kv, D)
+        # R == 1: no redistribute or col-gather needed; k/v are already the
+        # sorted tensors used by the Q-split branch below.
 
         # --- 4) Local attention.  K/V layout is path-specific:
         #   Q-split    -> full sorted (k_sorted, v_sorted) via one permute
@@ -459,13 +456,14 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
             # output: [C*L_local, H_q, D] grouped by destination col_idx
             # in the row group.  After all_to_all, o_recv[c, i] is the
             # partial from source col_idx=c for this rank's local token i.
-            o_send = output.contiguous().view(C, L_local, H_q, D)
-            o_recv = torch.empty_like(o_send)
-            dist.all_to_all_single(o_recv.view(-1), o_send.view(-1), group=row_pg)
-
-            lse_send = lse.contiguous().view(C, L_local, H_q)
-            lse_recv = torch.empty_like(lse_send)
-            dist.all_to_all_single(lse_recv.view(-1), lse_send.view(-1), group=row_pg)
+            # attn2d_row_alltoall takes a multi-list input (C tensors per
+            # list); we pass [o_chunks..., lse_chunks...] and unpack two
+            # outputs.
+            o_chunks = list(output.view(C, L_local, H_q, D).contiguous().unbind(0))
+            lse_chunks = list(lse.view(C, L_local, H_q).contiguous().unbind(0))
+            o_recv, lse_recv = attn2d_row_alltoall(o_chunks + lse_chunks, mapping)
+            # o_recv:   (C, L_local, H_q, D)
+            # lse_recv: (C, L_local, H_q)
 
             # merge_states wants (seq_len, num_states, ...).  C is the
             # state count; L_local is the seq_len for this rank.

@@ -337,6 +337,48 @@ def cp_allgather(
                       dim, sizes)
 
 
+def attn2d_row_allgather(
+    input: Union[torch.Tensor, List[torch.Tensor]],
+    mapping: Mapping,
+    dim: int = -1,
+    sizes: Optional[List[int]] = None,
+) -> Union[torch.Tensor, List[torch.Tensor]]:
+    '''
+    Allgather across the ATTN2D row subgroup (size C).
+
+    Mirrors :func:`cp_allgather` but targets ``mapping.attn2d_row_group``
+    / ``attn2d_row_group_pg``, so it works in both MPI mode (rank-list
+    keyed NCCL comm via ``torch.ops.trtllm.allgather``) and Ray mode
+    (boxed PG via ``torch.ops.trtllm.allgather_pg``).
+    '''
+    assert mapping.has_cp_attn2d(), \
+        "attn2d_row_allgather requires CP type ATTN2D"
+    group_boxed = mapping.attn2d_row_group_pg.boxed() if mpi_disabled(
+    ) else None
+    return _allgather(input, mapping.attn2d_row_group, mapping.attn2d_row_rank,
+                      group_boxed, dim, sizes)
+
+
+def attn2d_col_allgather(
+    input: Union[torch.Tensor, List[torch.Tensor]],
+    mapping: Mapping,
+    dim: int = -1,
+    sizes: Optional[List[int]] = None,
+) -> Union[torch.Tensor, List[torch.Tensor]]:
+    '''
+    Allgather across the ATTN2D column subgroup (size R).
+
+    Mirrors :func:`cp_allgather` but targets ``mapping.attn2d_col_group``
+    / ``attn2d_col_group_pg``.
+    '''
+    assert mapping.has_cp_attn2d(), \
+        "attn2d_col_allgather requires CP type ATTN2D"
+    group_boxed = mapping.attn2d_col_group_pg.boxed() if mpi_disabled(
+    ) else None
+    return _allgather(input, mapping.attn2d_col_group, mapping.attn2d_col_rank,
+                      group_boxed, dim, sizes)
+
+
 def alltoall_helix(
     inputs: List[torch.Tensor],
     group: List[int],
@@ -374,6 +416,31 @@ def alltoall_helix(
             "all input tensors in a group must have the same shape"
 
     return torch.ops.trtllm.alltoall_helix(inputs, group, num_lists)
+
+
+def attn2d_row_alltoall(
+    inputs: List[torch.Tensor],
+    mapping: Mapping,
+) -> List[torch.Tensor]:
+    '''
+    All-to-all across the ATTN2D row subgroup (size C).
+
+    Thin wrapper around :func:`alltoall_helix` with the row rank list.
+    The underlying ``torch.ops.trtllm.alltoall_helix`` is rank-list-keyed
+    and works in both MPI and Ray modes.
+
+    Args:
+        inputs: list of input tensors; ``len(inputs)`` must be a multiple
+            of the row-group size (= ``mapping.attn2d_col_size``).
+        mapping: the parallel mapping.
+
+    Returns:
+        One output tensor per input group, each with shape
+        ``(C, *input_shape)``.
+    '''
+    assert mapping.has_cp_attn2d(), \
+        "attn2d_row_alltoall requires CP type ATTN2D"
+    return alltoall_helix(inputs, mapping.attn2d_row_group)
 
 
 class HelixAllToAllNative:

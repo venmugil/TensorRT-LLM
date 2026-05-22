@@ -71,6 +71,12 @@ class _FakeMapping:
     The full ``Mapping`` class binds PGs through ``MpiTopology`` (no
     ``cp_group_pg``) or ``DeviceMeshTopologyImpl`` (Ray path); neither is a
     natural fit for this test, so we wire the subgroups by hand.
+
+    Exposes both the rank-list properties (``cp_group`` /
+    ``attn2d_row_group`` / ``attn2d_col_group``) consumed by the
+    ``ops.py`` collective wrappers and the corresponding ``_pg``
+    properties used in the PG-mode dispatch branch.  The test forces
+    that branch by setting ``TLLM_DISABLE_MPI=1`` in the worker.
     """
 
     def __init__(self, *, cp_rank: int, R: int, C: int, cp_pg, row_pg, col_pg):
@@ -100,6 +106,24 @@ class _FakeMapping:
     @property
     def attn2d_col_rank(self) -> int:
         return self.cp_rank // self._R
+
+    @property
+    def cp_group(self):
+        return list(range(self.cp_size))
+
+    @property
+    def attn2d_row_group(self):
+        R, C = self._R, self._C
+        row_rank = self.attn2d_row_rank
+        cp_group = self.cp_group
+        return [cp_group[row_rank + k * R] for k in range(C)]
+
+    @property
+    def attn2d_col_group(self):
+        R = self._R
+        col_rank = self.attn2d_col_rank
+        cp_group = self.cp_group
+        return [cp_group[col_rank * R + k] for k in range(R)]
 
     @property
     def attn2d_row_group_pg(self):
@@ -164,6 +188,12 @@ def _run_attn2d_check(
     dtype_name: str,
     seed: int,
 ) -> None:
+    # The ops.py collective wrappers branch on ``mpi_disabled()``.  This
+    # test uses hand-built torch PGs (no TRT-LLM-internal NCCL comm pool
+    # registration), so force the PG-mode dispatch by setting the env
+    # var before importing the backend.
+    os.environ["TLLM_DISABLE_MPI"] = "1"
+
     # Lazy import so the test module is collectable on hosts without
     # flashinfer; the parent test gating ensures we only reach here when
     # it is available.
