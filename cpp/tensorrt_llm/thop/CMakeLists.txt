@@ -113,6 +113,7 @@ add_library(
   ncclCommunicatorOp.cpp
   allocateOutput.cpp
   parallelDecodeKVCacheUpdateOp.cpp
+  permuteSendRecvOp.cpp
   redrafterCurandOp.cpp
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp

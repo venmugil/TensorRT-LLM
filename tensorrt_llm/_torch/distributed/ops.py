@@ -443,6 +443,43 @@ def attn2d_row_alltoall(
     return alltoall_helix(inputs, mapping.attn2d_row_group)
 
 
+def permute_send_recv(
+    input: torch.Tensor,
+    target_rank: int,
+    source_rank: int,
+    group: List[int],
+) -> torch.Tensor:
+    '''
+    Permutation collective: every rank in ``group`` sends ``input`` to world
+    rank ``target_rank`` and receives a same-shape, same-dtype tensor from
+    world rank ``source_rank``.
+
+    Both ``target_rank`` and ``source_rank`` must be members of ``group``;
+    the caller is responsible for ensuring the global send/recv pattern is
+    well-formed -- i.e. each rank's source is some other rank's target, so
+    every send has a matching recv.  The op does not validate this beyond
+    the per-rank membership check; mis-paired peers will deadlock.
+
+    Thin wrapper around ``torch.ops.trtllm.permute_send_recv``.  Like
+    :func:`alltoall_helix`, the underlying op is rank-list-keyed (uses the
+    TRT-LLM NCCL comm pool bootstrapped over MPI) and works in both MPI and
+    Ray modes without a ``torch.distributed`` ProcessGroup.
+
+    Args:
+        input: contiguous input tensor to send to ``target_rank``.
+        target_rank: world rank to send ``input`` to.
+        source_rank: world rank to receive the output from.
+        group: list of world ranks participating in this permutation.
+
+    Returns:
+        A fresh tensor with the same shape and dtype as ``input`` containing
+        the data received from ``source_rank``.
+    '''
+    assert input.is_contiguous(), "permute_send_recv input must be contiguous"
+    return torch.ops.trtllm.permute_send_recv(input, target_rank, source_rank,
+                                              group)
+
+
 class HelixAllToAllNative:
     """
     Manager for Helix All-to-All operations with MNNVL workspace management.

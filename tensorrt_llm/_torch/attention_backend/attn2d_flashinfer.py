@@ -84,12 +84,12 @@ from typing import List, Optional
 
 import flashinfer
 import torch
-import torch.distributed as dist
 
 from tensorrt_llm._torch.distributed import (
     attn2d_col_allgather,
     attn2d_row_allgather,
     attn2d_row_alltoall,
+    permute_send_recv,
 )
 from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -154,7 +154,7 @@ def _redistribute_kv_to_row_major(
     R: int,
     C: int,
     cp_rank: int,
-    cp_pg,
+    cp_group: List[int],
 ) -> torch.Tensor:
     """Permute packed K/V across cp_group: column-major -> row-major cyclic.
 
@@ -173,32 +173,27 @@ def _redistribute_kv_to_row_major(
     mirroring Q's stride-R partition from the row-gather and producing a
     regular causal mask pattern that optimized kernels can exploit.
 
-    Each rank participates in at most one isend + irecv pair on cp_pg.
-    The permutation is a mesh-transpose, so for R != C it is not an
+    Each rank participates in at most one send + recv pair via the
+    rank-list-keyed ``permute_send_recv`` op (NCCL group send/recv
+    bootstrapped through the TRT-LLM comm pool over MPI).  The
+    permutation is a mesh-transpose, so for R != C it is not an
     involution; ``source = (r%R)*C + (r//R)`` is the inverse of
     ``target = (r%C)*R + (r//C)``.
 
     No-op cases (caller's kv returned unchanged) include ``C == 1`` and
     main-diagonal ranks (``col_idx == row_idx`` for ``R == C``); both
     fall out of the ``target == cp_rank`` test.
-
-    Note: this is the only remaining call in the backend that needs a
-    torch ProcessGroup (``cp_pg``).  When a ``torch.ops.trtllm.permute_
-    send_recv`` op exists, this function can be replaced by a wrapper
-    keyed on ``mapping.cp_group`` so MPI-mode runs work without a PG.
     """
     target = (cp_rank % C) * R + (cp_rank // C)
     if target == cp_rank:
         return kv
     source = (cp_rank % R) * C + (cp_rank // R)
-    kv_recv = torch.empty_like(kv)
-    ops = [
-        dist.P2POp(dist.isend, kv, peer=target, group=cp_pg),
-        dist.P2POp(dist.irecv, kv_recv, peer=source, group=cp_pg),
-    ]
-    for req in dist.batch_isend_irecv(ops):
-        req.wait()
-    return kv_recv
+    return permute_send_recv(
+        kv.contiguous(),
+        target_rank=cp_group[target],
+        source_rank=cp_group[source],
+        group=cp_group,
+    )
 
 
 class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetadata]):
@@ -260,10 +255,6 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
         cp_rank = mapping.cp_rank
         row_idx = mapping.attn2d_row_rank
         col_idx = mapping.attn2d_col_rank
-        # cp_pg is still required for the K/V mesh-transpose swap below;
-        # the row/col collectives now go through wrappers that pick MPI
-        # vs PG mode internally and only need ``mapping``.
-        cp_pg = mapping.cp_group_pg
 
         H_q = self.num_heads
         H_kv = self.num_kv_heads
@@ -302,7 +293,6 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
                     row_idx=row_idx,
                     col_idx=col_idx,
                     mapping=mapping,
-                    cp_pg=cp_pg,
                 )
             )
             offset += local_len
@@ -323,7 +313,6 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
         row_idx: int,
         col_idx: int,
         mapping,
-        cp_pg,
     ) -> torch.Tensor:
         """Process one request's cyclic shard. Returns [L_local, H_q, D].
 
@@ -368,7 +357,9 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
 
         if R > 1:
             kv_send = torch.stack([k, v], dim=0).contiguous()
-            kv_send = _redistribute_kv_to_row_major(kv_send, R=R, C=C, cp_rank=cp_rank, cp_pg=cp_pg)
+            kv_send = _redistribute_kv_to_row_major(
+                kv_send, R=R, C=C, cp_rank=cp_rank, cp_group=mapping.cp_group
+            )
             # attn2d_col_allgather concatenates along dim 0; output is
             # rank-major, so .view(R, 2, ...) yields the same layout that
             # all_gather_into_tensor into a (R, 2, L_local, H_kv, D) buffer
