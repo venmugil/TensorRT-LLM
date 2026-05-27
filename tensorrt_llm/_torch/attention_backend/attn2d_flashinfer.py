@@ -180,14 +180,28 @@ def _redistribute_kv_to_row_major(
     involution; ``source = (r%R)*C + (r//R)`` is the inverse of
     ``target = (r%C)*R + (r//C)``.
 
-    No-op cases (caller's kv returned unchanged) include ``C == 1`` and
-    main-diagonal ranks (``col_idx == row_idx`` for ``R == C``); both
-    fall out of the ``target == cp_rank`` test.
+    Main-diagonal ranks (``target == cp_rank``, e.g.
+    ``col_idx == row_idx`` for ``R == C``) still call the op with self
+    as both peer ranks -- ``ncclSend``/``ncclRecv`` to self inside a
+    ``ncclGroupStart/End`` block executes as a memcpy.  This is
+    required for collective correctness: ``getComm(cp_group)`` is a
+    collective bootstrap that needs every rank in ``cp_group`` to
+    participate on the first call, even if a particular rank's
+    permutation is the identity.  Skipping the call on diagonal ranks
+    leaves the comm half-bootstrapped and deadlocks the others.
+
+    The exception is ``C == 1`` (and equivalently any mesh where every
+    rank is diagonal): no rank calls the op, the comm is never built,
+    nothing else in the backend uses ``cp_group``, so no participation
+    is needed.
     """
     target = (cp_rank % C) * R + (cp_rank // C)
-    if target == cp_rank:
-        return kv
     source = (cp_rank % R) * C + (cp_rank // R)
+    if C == 1:
+        # Every rank is diagonal -- skip the op entirely so no comm gets
+        # bootstrapped.  Safe because nothing else in this backend uses
+        # cp_group.
+        return kv
     return permute_send_recv(
         kv.contiguous(),
         target_rank=cp_group[target],
