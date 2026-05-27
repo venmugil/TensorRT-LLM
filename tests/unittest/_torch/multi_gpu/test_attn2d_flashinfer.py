@@ -257,18 +257,30 @@ def _entrypoint(world_size, R, C, L, num_heads, num_kv_heads, head_dim, dtype_na
 # ---------------------------------------------------------------------------
 
 
-# (R, C) coverage:
+# (R, C) coverage (capped at <= 8 GPUs to match the convention used by
+# every other test in tests/unittest/_torch/multi_gpu/ -- the shared
+# ``mpi_pool_executor`` fixture in tests/unittest/conftest.py:333
+# parametrizes worker counts as [2, 4, 8]).  Configurations needing more
+# than 8 GPUs (s=3 with full mesh, s=4 with full mesh) belong in
+# tests/integration/ once attn2d is wired into a model end-to-end and
+# can be exercised via the multi-node test lists.
+#
 #   (2, 2): square, Q-split with s=1 (both causal + strict-causal tiles)
 #   (2, 4), (4, 2): Q-split s=2 and K-split s=2
-#   (2, 8), (8, 2): s=4 splits (skipped automatically if < 16 GPUs)
 #   (3, 2): coprime -> custom_mask fallback branch
 #   (1, 4): R==1 fast path (skips K/V mesh-transpose and col all-gather);
-#           hits Q-split with k_sorted = k, v_sorted = v
+#           hits Q-split with k_sorted = k, v_sorted = v (degenerate s=4)
 #   (4, 1): C==1 fast path (skips Q row all-gather and the row-group
 #           all_to_all + LSE merge); output returns straight from the
-#           K-split branch
-#   (2, 6): Q-split with s=3 -- ranks with col_idx >= 2 see strict-
-#           causal on every t tile, exercising the all-strict pattern
+#           K-split branch (degenerate s=4)
+#
+# Known gaps deferred to integration tests:
+#   - Q-split s=3 (would be (2, 6), 12 GPUs)
+#   - Q-split s=4 with non-trivial K/V mesh-transpose (would be (2, 8))
+#   - K-split s=4 with full row all_to_all + LSE merge tail (would be
+#     (8, 2))
+#   - All-strict-causal tile pattern (subset of s=3 / large-s coverage)
+#
 # L_extra coverage:
 #   0: L divisible by P (uniform shard sizes)
 #   1: L = L_base + 1 -> rank 0 has one extra token (uneven sharding,
@@ -276,7 +288,7 @@ def _entrypoint(world_size, R, C, L, num_heads, num_kv_heads, head_dim, dtype_na
 #      pairs an uneven and an even rank in the K/V mesh-transpose)
 @pytest.mark.parametrize(
     "R,C",
-    [(2, 2), (2, 4), (4, 2), (2, 8), (8, 2), (3, 2), (1, 4), (4, 1), (2, 6)],
+    [(2, 2), (2, 4), (4, 2), (3, 2), (1, 4), (4, 1)],
 )
 @pytest.mark.parametrize("num_heads,num_kv_heads", [(4, 4), (8, 2)])
 @pytest.mark.parametrize("dtype_name", ["bfloat16"])
