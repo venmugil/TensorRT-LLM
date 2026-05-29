@@ -76,7 +76,7 @@ at exit.  The total length is read from ``metadata.total_input_lens``;
 if absent the backend assumes divisibility.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 import flashinfer
@@ -105,7 +105,9 @@ class Attn2DFlashInferAttentionMetadata(AttentionMetadata):
 
     Each rank receives a cyclic shard of every request's tokens:
     rank ``cp_rank`` owns positions ``{p: p % cp_size == cp_rank}``.
-    ``seq_lens`` is the per-request shard length on this rank.
+    ``seq_lens`` is the per-request shard length on this rank for the
+    new (current-chunk) tokens; ``cached_lens_local`` is the per-rank
+    count of previously cached tokens for the same request.
 
     ``total_input_lens`` is the per-request total length (same value on
     every rank).  When ``L_total % cp_size != 0``, ranks ``r < L_total %
@@ -117,12 +119,116 @@ class Attn2DFlashInferAttentionMetadata(AttentionMetadata):
 
     If ``total_input_lens`` is ``None``, the backend falls back to the
     divisible-L assumption and ``L_total = seq_lens * cp_size``.
+
+    Paged-KV state (``paged_kv_indices``, ``paged_kv_indptr``,
+    ``paged_kv_last_page_len``, ``workspace_buffer``) is allocated in
+    ``__post_init__`` when ``kv_cache_manager`` is set, and populated
+    in ``prepare()`` from the manager's per-request block IDs.  These
+    fields are not consumed by the compute path yet -- chunked /
+    multi-turn prefill arrives in a later phase -- but the metadata is
+    plumbed end-to-end so the engine can route ATTN2D requests through
+    the cached path.
     """
 
     total_input_lens: Optional[torch.Tensor] = None
 
+    # Per-request count of cached tokens on this rank (cyclic-shard view).
+    # Derived in ``prepare()`` from ``kv_cache_params.num_cached_tokens_per_seq``.
+    cached_lens_local: Optional[torch.Tensor] = None
+
+    # FlashInfer paged-KV workspace; sized once in ``__post_init__``.
+    workspace_buffer: Optional[torch.Tensor] = None
+
+    # Stable buffers populated in ``prepare()`` from ``kv_cache_manager``.
+    # Allocated in ``__post_init__`` when a cache manager is configured;
+    # left unset when ``kv_cache_manager is None`` (v0 no-cache path).
+    # ``repr=False`` so ``__repr__`` doesn't crash before allocation.
+    paged_kv_indices: torch.Tensor = field(init=False, repr=False)
+    paged_kv_indptr: torch.Tensor = field(init=False, repr=False)
+    paged_kv_last_page_len: torch.Tensor = field(init=False, repr=False)
+    num_blocks_per_request: List[int] = field(default_factory=list, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.kv_cache_manager is None:
+            return
+        max_num_pages = self.kv_cache_manager.blocks_in_primary_pool
+        self.paged_kv_indices = torch.empty((max_num_pages,), dtype=torch.int32, device="cuda")
+        self.paged_kv_indptr = torch.empty(
+            (self.max_num_requests + 1,), dtype=torch.int32, device="cuda"
+        )
+        self.paged_kv_last_page_len = torch.empty(
+            (self.max_num_requests,), dtype=torch.int32, device="cuda"
+        )
+        if self.workspace_buffer is None:
+            # 256 MB; matches the conservative end of FlashInfer's prefill
+            # workspace recommendation.  Tighten if profiling shows headroom.
+            self.workspace_buffer = torch.empty(
+                (256 * 1024 * 1024,), dtype=torch.uint8, device="cuda"
+            )
+
     def prepare(self) -> None:
         super().prepare()
+        if self.kv_cache_manager is None:
+            # No cache configured: v0 prefill path.  Leave paged-KV fields
+            # untouched (they were not allocated); cached_lens_local stays None
+            # so the backend treats every request as initial-chunk.
+            self.cached_lens_local = None
+            self.num_blocks_per_request = []
+            return
+
+        n = self.num_seqs
+        use_cache = self.kv_cache_params is not None and self.kv_cache_params.use_cache
+        cached_per_seq = (
+            list(self.kv_cache_params.num_cached_tokens_per_seq)
+            if use_cache and self.kv_cache_params.num_cached_tokens_per_seq is not None
+            else [0] * n
+        )
+        assert len(cached_per_seq) == n, (
+            f"num_cached_tokens_per_seq has {len(cached_per_seq)} entries, expected {n} (num_seqs)"
+        )
+        self.cached_lens_local = torch.tensor(cached_per_seq, dtype=torch.int32)
+
+        seq_lens_list = self.seq_lens.tolist() if self.seq_lens is not None else [0] * n
+        # kv_lens_local = this rank's cached + new K/V count for each request.
+        kv_lens_local = [c + s for c, s in zip(cached_per_seq, seq_lens_list)]
+
+        page_size = self.kv_cache_manager.tokens_per_block
+        self.num_blocks_per_request = [
+            (kv_len + page_size - 1) // page_size for kv_len in kv_lens_local
+        ]
+
+        # paged_kv_indices: flatten the per-request block lists in batch order.
+        # block_ids_per_seq[i] is rank-local: each rank's cache manager only
+        # tracks its own slice of the cyclic-sharded cache.
+        assert self.request_ids is not None, (
+            "request_ids must be set on metadata before prepare() when a KV "
+            "cache manager is configured"
+        )
+        block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(self.request_ids)
+        indices_list: List[int] = []
+        for i, block_ids in enumerate(block_ids_per_seq):
+            indices_list.extend(block_ids[: self.num_blocks_per_request[i]])
+        if indices_list:
+            indices_tensor = torch.tensor(indices_list, dtype=torch.int32)
+            self.paged_kv_indices[: indices_tensor.size(0)].copy_(indices_tensor, non_blocking=True)
+
+        # paged_kv_indptr: cumsum of per-request block counts (prefix 0).
+        indptr_list = [0]
+        for nb in self.num_blocks_per_request:
+            indptr_list.append(indptr_list[-1] + nb)
+        indptr_tensor = torch.tensor(indptr_list, dtype=torch.int32)
+        self.paged_kv_indptr[: indptr_tensor.size(0)].copy_(indptr_tensor, non_blocking=True)
+
+        # paged_kv_last_page_len: tokens in the last page per request.
+        last_page_lens = [
+            (kv_len - (nb - 1) * page_size) if nb > 0 else 0
+            for kv_len, nb in zip(kv_lens_local, self.num_blocks_per_request)
+        ]
+        last_page_tensor = torch.tensor(last_page_lens, dtype=torch.int32)
+        self.paged_kv_last_page_len[: last_page_tensor.size(0)].copy_(
+            last_page_tensor, non_blocking=True
+        )
 
     def update_attn2d_param(
         self,
@@ -246,9 +352,15 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
                 f"Attn2DFlashInferAttention only supports CAUSAL mask, got "
                 f"{forward_args.attention_mask}."
             )
-        if metadata.kv_cache_manager is not None:
+        # KV cache plumbing is wired through metadata, but the compute path
+        # still handles only initial-chunk prefill (no cached K/V).  Chunked /
+        # multi-turn prefill arrives in a later phase; until then, reject any
+        # request that has cached tokens on this rank.
+        if metadata.cached_lens_local is not None and int(metadata.cached_lens_local.sum()) > 0:
             raise NotImplementedError(
-                "Attn2DFlashInferAttention does not support KV cache (prefill only in v0)."
+                "Attn2DFlashInferAttention does not yet support non-empty KV "
+                "cache (chunked / multi-turn prefill).  Got cached_lens_local "
+                f"= {metadata.cached_lens_local.tolist()}; expected all zeros."
             )
         if k is None or v is None:
             raise NotImplementedError(
