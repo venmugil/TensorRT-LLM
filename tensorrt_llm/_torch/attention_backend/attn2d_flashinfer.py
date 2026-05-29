@@ -28,19 +28,20 @@ For each request, this backend:
      (col=col_idx owns positions ``{p: p%C == col_idx}``)
   3. all-gathers K/V within the col group (size R) -> [L/C, H_kv, D]
      (K and V are packed into a single fused collective)
-  4. computes local attention via flashinfer with log-sum-exp output;
-     square meshes use a position-sorted layout and ``causal=True``
-     (no custom mask), non-square meshes fall back to an absolute-
-     position custom mask
+  4. computes local attention via flashinfer with log-sum-exp output,
+     using a position-sorted layout and ``causal=True`` (no custom
+     mask) -- see mesh-shape constraint below
   5. scatters the L/R partials back to their original owners via
      all_to_all_single within the row group, then LSE-merges the C
      partials this rank receives -> final output for L/P tokens
 
-Mask shape after the gathers depends on the mesh aspect ratio.  Re-
-sorting Q and K/V into ascending absolute position gives positions
+Mesh aspect is constrained to ``R % C == 0`` or ``C % R == 0``;
+non-divisible meshes (e.g. ``R=3, C=2``, ``R=4, C=6``) are rejected.
+Re-sorting Q and K/V into ascending absolute position gives positions
 ``q_pos[m] = m*R + row_idx`` and ``k_pos[k] = k*C + col_idx``, so the
 ``k_pos <= q_pos`` mask becomes ``(k - m) * C <= row_idx - col_idx``
-(square mesh) or a stair-step with slope ``C/R`` otherwise.
+(square mesh) or a stair-step that the divisibility constraint
+decomposes cleanly:
 
   * **Square mesh** (``R == C``): ``k <= m`` for ``col_idx <= row_idx``
     (causal) and ``k < m`` for ``col_idx > row_idx`` (strict causal).
@@ -55,28 +56,24 @@ sorting Q and K/V into ascending absolute position gives positions
     full Q and produces a (strict-)causal pattern, but each output is
     a *partial* attention over a K-shard, so the ``s`` partials are
     LSE-merged via ``flashinfer.merge_states``.
-  * Otherwise (e.g. ``R=4, C=6``): ``custom_mask=(k_pos <= q_pos)``.
 
 Strict causal (``k < i``) on equal-length tensors is expressed by
 appending one dummy Q row so ``qo_len = L_q + 1`` and ``kv_len = L_q``;
 FlashInfer's bottom-right ``causal=True`` then applies ``k <= i - 1``
 on the real rows, and the dummy output / LSE are sliced off.
 
-FA2/FA3 public APIs do not expose ``custom_mask`` (and a user-defined
-mask rules out FA4), so FlashInfer is the only optimized kernel option
-for the fallback path.  KV cache, generation phase, fused QKV, sparse /
-sliding-window masks, and mixed-dtype quantization are out of scope for
-v0.  Inputs are assumed to be cyclic-sharded by the caller.
+KV cache, generation phase, fused QKV, sparse / sliding-window masks,
+and mixed-dtype quantization are out of scope for v0.  Inputs are
+assumed to be cyclic-sharded by the caller.
 
 For requests whose total length is not divisible by ``cp_size``, the
 backend pads each rank's local shard up to ``ceil(L_total / cp_size)``
 with zero rows so every collective stays uniform-shape.  Padding tokens
 land at absolute positions ``>= L_total``, so the causal mask
-``p_k <= p_q`` excludes them from every real-Q output (Q-split,
-K-split, and custom_mask paths all handle this naturally).  Padding Q
-outputs are sliced off at exit.  The total length is read from
-``metadata.total_input_lens``; if absent the backend assumes
-divisibility.
+``p_k <= p_q`` excludes them from every real-Q output (both Q-split and
+K-split paths handle this naturally).  Padding Q outputs are sliced off
+at exit.  The total length is read from ``metadata.total_input_lens``;
+if absent the backend assumes divisibility.
 """
 
 from dataclasses import dataclass
@@ -265,6 +262,11 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
         )
         R = mapping.attn2d_row_size
         C = mapping.attn2d_col_size
+        assert R % C == 0 or C % R == 0, (
+            f"Attn2DFlashInferAttention requires R % C == 0 or C % R == 0, "
+            f"got R={R}, C={C}.  Non-divisible meshes (e.g. 3x2, 4x6) are "
+            f"not supported -- pick a mesh where one dim divides the other."
+        )
         P = mapping.cp_size
         cp_rank = mapping.cp_rank
         row_idx = mapping.attn2d_row_rank
@@ -346,7 +348,6 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
         )
         H_q, D = q.shape[1], q.shape[2]
         H_kv = k.shape[1]
-        device = q.device
 
         if pad_rows:
             q = torch.cat([q, q.new_zeros(pad_rows, H_q, D)], dim=0)
@@ -386,7 +387,6 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
         #   Q-split    -> full sorted (k_sorted, v_sorted) via one permute
         #   K-split    -> per-u contiguous (K_u, V_u) views into one
         #                 permute -- no second copy in the per-u loop
-        #   fallback   -> source-rank-grouped (k_full, v_full)
         if C % R == 0:
             # Q-split path (includes square mesh as s == 1).
             # Each Q_t is the sorted Q at stride s, with positions
@@ -494,38 +494,6 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
                 .view(L_q, H_q, D)
             )
             lse = lse_sorted.view(L_local, C, H_q).transpose(0, 1).contiguous().view(L_q, H_q)
-        else:
-            # Custom-mask fallback: neither R % C == 0 nor C % R == 0
-            # (e.g. R = 3, C = 2, or R = 4, C = 6).  Build the
-            # absolute-position mask directly on the source-rank-grouped
-            # K/V.  R > 1 is guaranteed (R == 1 always hits Q-split).
-            k_full = kv_recv[:, 0].reshape(L_k, H_kv, D)
-            v_full = kv_recv[:, 1].reshape(L_k, H_kv, D)
-            # Row-gather concatenates source ranks in row-group order
-            # (col_idx_src = 0..C-1); source rank col_idx_src has cp_rank
-            # = col_idx_src*R + row_idx, so its local token at index i
-            # maps to position col_idx_src*R + row_idx + i*P.
-            col_src = torch.arange(C, device=device).repeat_interleave(L_local)
-            local_i = torch.arange(L_local, device=device).repeat(C)
-            q_pos = col_src * R + row_idx + local_i * P  # [L_q]
-
-            # After the row-major redistribution, source rank at
-            # row_idx_src in col_pg holds positions
-            # {p: p%P == row_idx_src*C + col_idx}, so its local token at
-            # index j maps to position col_idx + row_idx_src*C + j*P.
-            row_src = torch.arange(R, device=device).repeat_interleave(L_local)
-            local_j = torch.arange(L_local, device=device).repeat(R)
-            k_pos = col_idx + row_src * C + local_j * P  # [L_k]
-
-            custom_mask = k_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
-            output, lse = flashinfer.single_prefill_with_kv_cache(
-                q_full,
-                k_full,
-                v_full,
-                custom_mask=custom_mask,
-                kv_layout="NHD",
-                return_lse=True,
-            )
         # output: [L_q, H_q, D] in source-rank-grouped order;
         # lse:    [L_q, H_q] (natural log).
 

@@ -265,9 +265,11 @@ def _entrypoint(world_size, R, C, L, num_heads, num_kv_heads, head_dim, dtype_na
 # tests/integration/ once attn2d is wired into a model end-to-end and
 # can be exercised via the multi-node test lists.
 #
+# Backend constraint: R % C == 0 or C % R == 0 -- non-divisible meshes
+# (e.g. (3, 2)) are rejected by an assertion in forward().
+#
 #   (2, 2): square, Q-split with s=1 (both causal + strict-causal tiles)
 #   (2, 4), (4, 2): Q-split s=2 and K-split s=2
-#   (3, 2): coprime -> custom_mask fallback branch
 #   (1, 4): R==1 fast path (skips K/V mesh-transpose and col all-gather);
 #           hits Q-split with k_sorted = k, v_sorted = v (degenerate s=4)
 #   (4, 1): C==1 fast path (skips Q row all-gather and the row-group
@@ -284,11 +286,10 @@ def _entrypoint(world_size, R, C, L, num_heads, num_kv_heads, head_dim, dtype_na
 # L_extra coverage:
 #   0: L divisible by P (uniform shard sizes)
 #   1: L = L_base + 1 -> rank 0 has one extra token (uneven sharding,
-#      pad/trim path exercised; for the coprime (3,2) mesh this also
-#      pairs an uneven and an even rank in the K/V mesh-transpose)
+#      pad/trim path exercised)
 @pytest.mark.parametrize(
     "R,C",
-    [(2, 2), (2, 4), (4, 2), (3, 2), (1, 4), (4, 1)],
+    [(2, 2), (2, 4), (4, 2), (1, 4), (4, 1)],
 )
 @pytest.mark.parametrize("num_heads,num_kv_heads", [(4, 4), (8, 2)])
 @pytest.mark.parametrize("dtype_name", ["bfloat16"])
@@ -524,9 +525,9 @@ def _entrypoint_multi(
 
 # (R, C) coverage for multi-request:
 #   (2, 2): square mesh, Q-split path
-#   (3, 2): coprime -> custom_mask fallback (verifies multi-request also
-#           drives the non-divisible mesh branch in lockstep)
-@pytest.mark.parametrize("R,C", [(2, 2), (3, 2)])
+#   (4, 2): K-split path (verifies multi-request also drives the K-split
+#           merge_states tail in lockstep across ranks)
+@pytest.mark.parametrize("R,C", [(2, 2), (4, 2)])
 def test_attn2d_flashinfer_multi_request_batch(R, C):
     """Backend forward must correctly iterate a multi-request batch.
 
