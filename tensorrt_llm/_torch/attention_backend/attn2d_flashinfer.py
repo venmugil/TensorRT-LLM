@@ -117,6 +117,18 @@ class Attn2DFlashInferAttentionMetadata(AttentionMetadata):
     from real-Q attention outputs.  Padding Q outputs are sliced off
     at exit.
 
+    ``chunk_input_lens`` is the per-request current-chunk length
+    (``L_chunk``, same value on every rank).  ``L_chunk == L_total``
+    means initial-chunk prefill (no cached K/V); ``L_chunk < L_total``
+    means chunked / multi-turn prefill with ``L_prev = L_total -
+    L_chunk`` cached K/V tokens globally.  Chunk Q is padded per-rank
+    to ``ceil(L_chunk / cp_size)`` independently of K's padding to
+    ``ceil(L_total / cp_size)``; the FlashInfer kernel sees
+    ``kv_len > qo_len`` for chunked-prefill calls and the bottom-right
+    causal mask absorbs the ``L_prev`` shift cleanly.  If
+    ``chunk_input_lens`` is ``None`` the backend treats every request
+    as initial-chunk (``L_chunk == L_total``).
+
     If ``total_input_lens`` is ``None``, the backend falls back to the
     divisible-L assumption and ``L_total = seq_lens * cp_size``.
 
@@ -131,6 +143,10 @@ class Attn2DFlashInferAttentionMetadata(AttentionMetadata):
     """
 
     total_input_lens: Optional[torch.Tensor] = None
+
+    # Per-request current-chunk length (global L_chunk, same on every rank).
+    # ``None`` means initial-chunk prefill (L_chunk == L_total).
+    chunk_input_lens: Optional[torch.Tensor] = None
 
     # Per-request count of cached tokens on this rank (cyclic-shard view).
     # Derived in ``prepare()`` from ``kv_cache_params.num_cached_tokens_per_seq``.
@@ -233,8 +249,9 @@ class Attn2DFlashInferAttentionMetadata(AttentionMetadata):
     def update_attn2d_param(
         self,
         total_input_lens: Optional[List[int]],
+        chunk_input_lens: Optional[List[int]] = None,
     ) -> None:
-        """Set per-request total input lengths for the ATTN2D backend.
+        """Set per-request total / chunk input lengths for the ATTN2D backend.
 
         Called from the model engine's prepare-inputs path once per
         batch, alongside ``seq_lens`` (mirrors ``update_helix_param``).
@@ -244,11 +261,19 @@ class Attn2DFlashInferAttentionMetadata(AttentionMetadata):
                 length, one entry per request in the batch.  When
                 ``None`` (or omitted by the engine) the backend falls
                 back to the divisible-L assumption.
+            chunk_input_lens: per-request current-chunk length (global
+                L_chunk).  When ``None`` the backend treats every
+                request as initial-chunk (``L_chunk == L_total``).
         """
         if total_input_lens is None:
             self.total_input_lens = None
-            return
-        self.total_input_lens = torch.tensor(total_input_lens, dtype=torch.int32)
+        else:
+            self.total_input_lens = torch.tensor(total_input_lens, dtype=torch.int32)
+
+        if chunk_input_lens is None:
+            self.chunk_input_lens = None
+        else:
+            self.chunk_input_lens = torch.tensor(chunk_input_lens, dtype=torch.int32)
 
 
 def _redistribute_kv_to_row_major(

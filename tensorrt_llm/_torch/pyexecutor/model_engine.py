@@ -3358,11 +3358,12 @@ class PyTorchModelEngine(ModelEngine):
                 cross_encoder_seq_lens.append(0)
                 cross_encoder_cached_tokens_per_seq.append(encoder_output_len)
 
-        # ATTN2D collects the per-request un-sharded total length for the
-        # attention backend's padding path.  Cache the invariant to avoid
-        # per-request method calls.
+        # ATTN2D collects the per-request un-sharded total length and
+        # current-chunk length for the attention backend's padding path.
+        # Cache the invariant to avoid per-request method calls.
         _has_cp_attn2d = self.mapping.has_cp_attn2d()
         attn2d_total_input_lens: List[int] = []
+        attn2d_chunk_input_lens: List[int] = []
 
         for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
@@ -3418,6 +3419,10 @@ class PyTorchModelEngine(ModelEngine):
                  or getattr(request, "py_encoder_output", None) is not None))
             if _has_cp_attn2d:
                 attn2d_total_input_lens.append(request.total_input_len_cp)
+                # Current-chunk global length: how many new (un-cached)
+                # tokens this iteration covers across the conversation,
+                # before per-rank cyclic sharding.
+                attn2d_chunk_input_lens.append(request.context_chunk_size)
 
             # Embed mask is required only for partial iterations (chunked
             # prefill or KV-cache reuse); full-prefill degrades gracefully.
@@ -4157,7 +4162,9 @@ class PyTorchModelEngine(ModelEngine):
 
         if _has_cp_attn2d:
             attn_metadata.update_attn2d_param(
-                total_input_lens=attn2d_total_input_lens, )
+                total_input_lens=attn2d_total_input_lens,
+                chunk_input_lens=attn2d_chunk_input_lens,
+            )
 
         if not attn_metadata.is_cuda_graph:
             # Assumes seq lens do not change between CUDA graph invocations. This applies
@@ -4351,11 +4358,12 @@ class PyTorchModelEngine(ModelEngine):
         request_ids = []
         multimodal_params_list = []
 
-        # ATTN2D collects the per-request un-sharded total length for the
-        # attention backend's padding path.  Cache the invariant to avoid
-        # per-request method calls.
+        # ATTN2D collects the per-request un-sharded total length and
+        # current-chunk length for the attention backend's padding path.
+        # Cache the invariant to avoid per-request method calls.
         _has_cp_attn2d = self.mapping.has_cp_attn2d()
         attn2d_total_input_lens: List[int] = []
+        attn2d_chunk_input_lens: List[int] = []
 
         for request in scheduled_requests.context_requests:
             prompt_tokens = request.get_tokens(0)
@@ -4373,6 +4381,9 @@ class PyTorchModelEngine(ModelEngine):
             draft_lens.append(0)
             if _has_cp_attn2d:
                 attn2d_total_input_lens.append(request.total_input_len_cp)
+                # No-cache path runs the full prompt as a single chunk, so
+                # chunk == total (initial-chunk prefill).
+                attn2d_chunk_input_lens.append(request.total_input_len_cp)
             multimodal_embedding = request.multimodal_embedding
             if multimodal_embedding is not None:
                 multi_modal_data.append(multimodal_embedding)
@@ -4438,7 +4449,9 @@ class PyTorchModelEngine(ModelEngine):
 
         if _has_cp_attn2d:
             attn_metadata.update_attn2d_param(
-                total_input_lens=attn2d_total_input_lens, )
+                total_input_lens=attn2d_total_input_lens,
+                chunk_input_lens=attn2d_chunk_input_lens,
+            )
 
         attn_metadata.num_contexts = scheduled_requests.num_context_requests
 
