@@ -448,11 +448,12 @@ def permute_send_recv(
     target_rank: int,
     source_rank: int,
     group: List[int],
+    recv_count: Optional[int] = None,
 ) -> torch.Tensor:
     '''
     Permutation collective: every rank in ``group`` sends ``input`` to world
-    rank ``target_rank`` and receives a same-shape, same-dtype tensor from
-    world rank ``source_rank``.
+    rank ``target_rank`` and receives a same-dtype tensor from world rank
+    ``source_rank``.
 
     Both ``target_rank`` and ``source_rank`` must be members of ``group``;
     the caller is responsible for ensuring the global send/recv pattern is
@@ -470,14 +471,22 @@ def permute_send_recv(
         target_rank: world rank to send ``input`` to.
         source_rank: world rank to receive the output from.
         group: list of world ranks participating in this permutation.
+        recv_count: when set, override the output tensor's dim-0 size.
+            Trailing dimensions still match ``input``.  Used for the
+            asymmetric mesh-transpose in ATTN2D's chunked / multi-turn
+            prefill, where paired ranks may hold different cyclic-shard
+            counts.  Caller must ensure that this rank's ``recv_count``
+            equals the sender's dim-0 size (the underlying NCCL pair
+            cannot detect a numel mismatch ahead of time).
 
     Returns:
-        A fresh tensor with the same shape and dtype as ``input`` containing
-        the data received from ``source_rank``.
+        A fresh tensor with the data received from ``source_rank``.  Shape
+        is ``input.shape`` when ``recv_count`` is ``None``, else
+        ``(recv_count, *input.shape[1:])``.
     '''
     assert input.is_contiguous(), "permute_send_recv input must be contiguous"
     return torch.ops.trtllm.permute_send_recv(input, target_rank, source_rank,
-                                              group)
+                                              group, recv_count)
 
 
 class HelixAllToAllNative:
