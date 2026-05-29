@@ -3371,8 +3371,17 @@ class PyTorchModelEngine(ModelEngine):
             begin_compute = request.context_current_position
             end_compute = begin_compute + request.context_chunk_size
             prompt_tokens = all_prompt_tokens[begin_compute:end_compute]
-            position_ids.extend(
-                range(begin_compute, begin_compute + len(prompt_tokens)))
+            if request.position_ids is not None:
+                # CP modes (ATTN2D, helix-disagg) populate request.position_ids
+                # with absolute positions on this rank; slice it by the chunk
+                # window instead of generating linear positions from
+                # begin_compute, which would be wrong for cyclic-sharded inputs.
+                position_ids.extend(
+                    request.position_ids[begin_compute:begin_compute +
+                                         len(prompt_tokens)])
+            else:
+                position_ids.extend(
+                    range(begin_compute, begin_compute + len(prompt_tokens)))
 
             # Start offset of this request's (current-chunk) tokens within the
             # flattened input_ids. Recorded on multimodal_params below so models
@@ -4921,8 +4930,11 @@ class PyTorchModelEngine(ModelEngine):
                 return self._prepare_star_attention_inputs(
                     scheduled_requests, kv_cache_manager, attn_metadata,
                     resource_manager)
-            elif cp_type in (CpType.HELIX, CpType.ULYSSES):
+            elif cp_type in (CpType.HELIX, CpType.ULYSSES, CpType.ATTN2D):
                 # Take the usual route of _prepare_tp_inputs.
+                # ATTN2D-specific metadata (total_input_lens) is populated
+                # inside _prepare_tp_inputs; cyclic absolute position_ids are
+                # read off request.position_ids, also handled inline below.
                 pass
             else:
                 raise NotImplementedError(
