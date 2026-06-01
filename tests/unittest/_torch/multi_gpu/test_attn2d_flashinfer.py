@@ -562,3 +562,286 @@ def test_attn2d_flashinfer_multi_request_batch(R, C):
         results = ex.map(_entrypoint_multi, *zip(*[args] * P))
         for r in results:
             assert r is True
+
+
+# ---------------------------------------------------------------------------
+# Chunked-prefill test: exercise the cache write + read + chunked compute
+# paths in a single forward sequence (two consecutive forwards on the same
+# request, second forward reads chunk 1's K/V from the cache and merges with
+# chunk 2's new K/V).
+# ---------------------------------------------------------------------------
+
+
+class _MockKVCacheManager:
+    """Minimal per-rank KV cache manager satisfying the backend's API.
+
+    The backend pulls four things off ``metadata.kv_cache_manager``:
+        * ``tokens_per_block``        -> page size
+        * ``blocks_in_primary_pool``  -> max pages on this rank
+        * ``get_buffers(layer_idx, kv_layout)``  -> NHD cache buffer
+        * ``get_batch_cache_indices(request_ids)`` -> per-request page lists
+
+    Pages are pre-allocated per request via ``allocate_pages``; this is a
+    test harness, not a production allocator, so we just hand out
+    contiguous IDs.  NHD layout matches what flashinfer.page.append_paged_kv_cache
+    and the backend's ``_materialize_kv_from_pages`` expect:
+    ``(max_pages, 2, page_size, num_kv_heads, head_dim)``.
+    """
+
+    def __init__(
+        self,
+        *,
+        page_size: int,
+        max_pages: int,
+        num_kv_heads: int,
+        head_dim: int,
+        dtype: torch.dtype,
+        device: torch.device,
+    ):
+        self.tokens_per_block = page_size
+        self.blocks_in_primary_pool = max_pages
+        self._buffer = torch.zeros(
+            (max_pages, 2, page_size, num_kv_heads, head_dim),
+            dtype=dtype,
+            device=device,
+        )
+        self._req_pages = {}
+        self._next_page = 0
+
+    def get_buffers(self, layer_idx: int, kv_layout: str = "NHD") -> torch.Tensor:
+        assert kv_layout == "NHD", "test mock only supports NHD layout"
+        return self._buffer
+
+    def get_batch_cache_indices(self, request_ids):
+        return [self._req_pages[req_id] for req_id in request_ids]
+
+    def allocate_pages(self, req_id: int, num_pages: int) -> None:
+        assert self._next_page + num_pages <= self.blocks_in_primary_pool, (
+            f"out of pages: tried to allocate {num_pages} after {self._next_page}, "
+            f"have {self.blocks_in_primary_pool}"
+        )
+        self._req_pages[req_id] = list(range(self._next_page, self._next_page + num_pages))
+        self._next_page += num_pages
+
+
+@torch.inference_mode()
+def _run_attn2d_chunked_check(
+    world_size: int,
+    rank: int,
+    R: int,
+    C: int,
+    L: int,
+    L_chunk_1: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype_name: str,
+    seed: int,
+) -> None:
+    from tensorrt_llm._torch.attention_backend.attn2d_flashinfer import (
+        Attn2DFlashInferAttention,
+        Attn2DFlashInferAttentionMetadata,
+    )
+    from tensorrt_llm._torch.attention_backend.interface import (
+        AttentionForwardArgs,
+        PredefinedAttentionMask,
+    )
+    from tensorrt_llm._torch.metadata import KVCacheParams
+
+    dtype = getattr(torch, dtype_name)
+    P = R * C
+    assert world_size == P
+    L_chunk_2 = L - L_chunk_1
+    assert L_chunk_1 > 0 and L_chunk_2 > 0, (
+        f"both chunks must be non-empty: L={L}, L_chunk_1={L_chunk_1}"
+    )
+    # Keep the chunk boundary P-aligned for this test so per-rank counts stay
+    # clean (the variable-size collectives handle non-aligned boundaries too,
+    # but that's covered by a separate test).
+    assert L_chunk_1 % P == 0, f"chunk boundary L_chunk_1={L_chunk_1} must be a multiple of P={P}"
+
+    L_local = L // P  # uniform under L % P == 0
+    L_local_chunk_1 = L_chunk_1 // P
+    L_local_chunk_2 = L_chunk_2 // P
+    hidden = num_heads * head_dim
+    kv_hidden = num_kv_heads * head_dim
+
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+    mapping = _build_mapping(rank, P, R, C)
+    cp_rank = mapping.cp_rank
+
+    # Deterministic global Q/K/V (same on every rank).
+    gen = torch.Generator().manual_seed(seed)
+    q_full = torch.randn(L, hidden, dtype=dtype, generator=gen).to(device)
+    k_full = torch.randn(L, kv_hidden, dtype=dtype, generator=gen).to(device)
+    v_full = torch.randn(L, kv_hidden, dtype=dtype, generator=gen).to(device)
+
+    # Cyclic shard.
+    q_local_full = q_full[cp_rank::P].contiguous()
+    k_local_full = k_full[cp_rank::P].contiguous()
+    v_local_full = v_full[cp_rank::P].contiguous()
+
+    # Per-chunk slices of THIS rank's cyclic shard (in cyclic order, which
+    # = sorted absolute-position order, so chunk 1 is the first
+    # L_local_chunk_1 entries of the shard and chunk 2 is the rest).
+    q_local_c1 = q_local_full[:L_local_chunk_1].contiguous()
+    k_local_c1 = k_local_full[:L_local_chunk_1].contiguous()
+    v_local_c1 = v_local_full[:L_local_chunk_1].contiguous()
+    q_local_c2 = q_local_full[L_local_chunk_1:].contiguous()
+    k_local_c2 = k_local_full[L_local_chunk_1:].contiguous()
+    v_local_c2 = v_local_full[L_local_chunk_1:].contiguous()
+
+    # Mock cache manager: 1 page = L_local tokens for simplicity (one page
+    # per rank per request).  Allocate enough pages for ceil(L_local / page_size).
+    page_size = max(8, L_local)
+    num_pages = (L_local + page_size - 1) // page_size
+    max_pages = max(num_pages * 4, 8)
+    req_id = 0
+    cache_mgr = _MockKVCacheManager(
+        page_size=page_size,
+        max_pages=max_pages,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    cache_mgr.allocate_pages(req_id, num_pages)
+
+    backend = Attn2DFlashInferAttention(
+        layer_idx=0,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        num_kv_heads=num_kv_heads,
+    )
+
+    def _build_metadata(seq_lens_val: int, total: int, chunk: int, cached_local: int):
+        md = Attn2DFlashInferAttentionMetadata(
+            max_num_requests=1,
+            max_num_tokens=L_local_chunk_1 + L_local_chunk_2,
+            seq_lens=torch.tensor([seq_lens_val], dtype=torch.int32),
+            num_contexts=1,
+            mapping=mapping,
+            kv_cache_manager=cache_mgr,
+            kv_cache_params=KVCacheParams(
+                use_cache=True,
+                num_cached_tokens_per_seq=[cached_local],
+            ),
+            total_input_lens=torch.tensor([total], dtype=torch.int32),
+            chunk_input_lens=torch.tensor([chunk], dtype=torch.int32),
+        )
+        md.request_ids = [req_id]
+        md.prepare()
+        return md
+
+    forward_args = AttentionForwardArgs(attention_mask=PredefinedAttentionMask.CAUSAL)
+
+    # --- Forward 1: chunk 1 (L_prev = 0). ---
+    md1 = _build_metadata(
+        seq_lens_val=L_local_chunk_1,
+        total=L_chunk_1,
+        chunk=L_chunk_1,
+        cached_local=0,
+    )
+    out_c1 = backend.forward(q_local_c1, k_local_c1, v_local_c1, md1, forward_args=forward_args)
+    assert out_c1.shape[0] == L_local_chunk_1
+
+    # --- Forward 2: chunk 2 (L_prev = L_chunk_1).  Cache now holds chunk 1
+    # K/V; chunk 2's forward writes new K/V then reads (cached + new) for
+    # the mesh comm.
+    md2 = _build_metadata(
+        seq_lens_val=L_local_chunk_2,
+        total=L,  # cumulative K range = L_chunk_1 + L_chunk_2 = L
+        chunk=L_chunk_2,
+        cached_local=L_local_chunk_1,
+    )
+    out_c2 = backend.forward(q_local_c2, k_local_c2, v_local_c2, md2, forward_args=forward_args)
+    assert out_c2.shape[0] == L_local_chunk_2
+
+    # Concatenate chunk outputs in cyclic order (== absolute-position order
+    # since L mod P == 0 makes the shard contiguous in absolute positions).
+    out_local = torch.cat([out_c1, out_c2], dim=0)
+    assert out_local.shape[0] == L_local
+
+    # Gather and compare against single-GPU full-causal SDPA.
+    out_full = _gather_full_output(
+        out_local,
+        L=L,
+        L_max=L_local,
+        hidden=hidden,
+        P=P,
+        dtype=dtype,
+        device=device,
+        mapping=mapping,
+    )
+    if rank == 0:
+        out_full = out_full.view(L, num_heads, head_dim)
+        out_ref = _reference_full_causal_sdpa(
+            q_full, k_full, v_full, num_heads, num_kv_heads, head_dim
+        )
+        atol = 2e-2 if dtype == torch.bfloat16 else 1e-3
+        rtol = 1e-2 if dtype == torch.bfloat16 else 1e-3
+        torch.testing.assert_close(out_full, out_ref, atol=atol, rtol=rtol)
+
+
+def _entrypoint_chunked(
+    world_size, R, C, L, L_chunk_1, num_heads, num_kv_heads, head_dim, dtype_name, seed
+):
+    rank = tensorrt_llm.mpi_rank()
+    try:
+        _run_attn2d_chunked_check(
+            world_size,
+            rank,
+            R,
+            C,
+            L,
+            L_chunk_1,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            dtype_name,
+            seed,
+        )
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+# Chunked-prefill coverage:
+#   (2, 2): square mesh, Q-split degenerate s=1 (most cases).
+#   (4, 2): K-split with s=2 (verifies LSE-merge across u under chunked prefill).
+#   (2, 4): Q-split with s=2 (verifies per-t shift derivation under chunked prefill).
+@pytest.mark.parametrize("R,C", [(2, 2), (4, 2), (2, 4)])
+def test_attn2d_flashinfer_chunked_prefill(R, C):
+    """Two-chunk prefill (cache write + read) matches single-shot SDPA.
+
+    The first forward processes chunk 1 with empty cache; new K/V is
+    appended.  The second forward processes chunk 2: cache write appends
+    chunk 2's K/V, cache read materializes the full (chunk 1 + chunk 2)
+    K/V for this rank, mesh comm operates on it, and the kernel call uses
+    ``kv_len > qo_len`` (chunk 2 attends to both chunks).  Concatenating
+    the two chunks' outputs in cyclic-shard order must match the
+    single-shot ATTN2D / full-causal SDPA reference.
+    """
+    pytest.importorskip("flashinfer")
+    P = R * C
+    if torch.cuda.device_count() < P:
+        pytest.skip(f"needs {P} CUDA devices, have {torch.cuda.device_count()}")
+
+    # P-aligned L and chunk boundary so per-rank counts are uniform.  This
+    # is the cleanest chunked-prefill case; non-aligned boundaries exercise
+    # the variable-size collectives more aggressively and are deferred to a
+    # follow-up test.
+    L = ((max(64, 8 * P) + P - 1) // P) * P
+    L_chunk_1 = L // 2
+    head_dim = 64
+    dtype_name = "bfloat16"
+    seed = 0xC04ED
+    num_heads, num_kv_heads = 4, 4
+
+    args = (P, R, C, L, L_chunk_1, num_heads, num_kv_heads, head_dim, dtype_name, seed)
+    with MPIPoolExecutor(max_workers=P) as ex:
+        results = ex.map(_entrypoint_chunked, *zip(*[args] * P))
+        for r in results:
+            assert r is True

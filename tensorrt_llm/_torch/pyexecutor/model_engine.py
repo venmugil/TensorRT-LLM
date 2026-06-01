@@ -3418,7 +3418,14 @@ class PyTorchModelEngine(ModelEngine):
                 (not getattr(request, "is_dummy", False)
                  or getattr(request, "py_encoder_output", None) is not None))
             if _has_cp_attn2d:
-                attn2d_total_input_lens.append(request.total_input_len_cp)
+                # ATTN2D's "total" means the *cumulative K range so far*
+                # (= L_prev + L_chunk), not the full conversation length:
+                # the kernel's mask only cares about positions [0, L_prev +
+                # L_chunk).  Full conversation length leaks future-chunk
+                # positions into the cyclic count math and breaks the
+                # mesh-comm size derivation.
+                attn2d_total_input_lens.append(begin_compute +
+                                               request.context_chunk_size)
                 # Current-chunk global length: how many new (un-cached)
                 # tokens this iteration covers across the conversation,
                 # before per-rank cyclic sharding.

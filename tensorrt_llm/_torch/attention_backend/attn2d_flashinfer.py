@@ -109,21 +109,21 @@ class Attn2DFlashInferAttentionMetadata(AttentionMetadata):
     new (current-chunk) tokens; ``cached_lens_local`` is the per-rank
     count of previously cached tokens for the same request.
 
-    ``total_input_lens`` is the per-request total length (same value on
-    every rank).  When ``L_total % cp_size != 0``, ranks ``r < L_total %
-    cp_size`` get one extra token; the backend pads every rank up to
-    ``ceil(L_total / cp_size)`` so all collectives stay uniform-shape
-    and the natural causal mask excludes padding positions (>= L_total)
-    from real-Q attention outputs.  Padding Q outputs are sliced off
-    at exit.
+    ``total_input_lens`` is the per-request cumulative K-range length
+    (``L_total = L_prev + L_chunk``, same value on every rank), NOT the
+    full conversation length.  For initial-chunk prefill, L_prev = 0 so
+    L_total equals the prompt length; for chunked / multi-turn prefill
+    on iteration N, L_total = (prior chunks total) + (this chunk size).
+    The kernel mask only cares about positions in [0, L_total), and the
+    cyclic counts derived from L_total must match this rank's actual
+    K (cached + new) shard -- using the full conversation length here
+    would leak future-chunk positions into the size math.
 
     ``chunk_input_lens`` is the per-request current-chunk length
     (``L_chunk``, same value on every rank).  ``L_chunk == L_total``
     means initial-chunk prefill (no cached K/V); ``L_chunk < L_total``
     means chunked / multi-turn prefill with ``L_prev = L_total -
-    L_chunk`` cached K/V tokens globally.  Chunk Q is padded per-rank
-    to ``ceil(L_chunk / cp_size)`` independently of K's padding to
-    ``ceil(L_total / cp_size)``; the FlashInfer kernel sees
+    L_chunk`` cached K/V tokens globally.  The FlashInfer kernel sees
     ``kv_len > qo_len`` for chunked-prefill calls and the bottom-right
     causal mask absorbs the ``L_prev`` shift cleanly.  If
     ``chunk_input_lens`` is ``None`` the backend treats every request
