@@ -417,6 +417,15 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
         k = k.view(-1, H_kv, D)
         v = v.view(-1, H_kv, D)
 
+        # Write rank-local new K/V to the paged cache (batch-level, before
+        # the per-request attention compute).  Required for disagg so the
+        # cache is populated when the context server hands off to the gen
+        # server.  Compute below still reads K/V from the input args -- the
+        # cache-read path arrives in a later phase, alongside chunked /
+        # multi-turn support.
+        if metadata.kv_cache_manager is not None:
+            self._append_new_kv_to_cache(k, v, metadata)
+
         seq_lens = metadata.seq_lens.tolist()
         # Per-request total length (same on every rank).  When None, fall
         # back to the divisibility assumption L_total = L_local * P.
@@ -451,6 +460,69 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
             offset += local_len
 
         return torch.cat(outputs, dim=0).reshape(-1, H_q * D)
+
+    def _append_new_kv_to_cache(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        metadata: Attn2DFlashInferAttentionMetadata,
+    ) -> None:
+        """Append this rank's new K/V to the paged cache (batch-level).
+
+        ``k``, ``v`` are this rank's freshly-computed K/V for the current
+        chunk, shape ``(total_new_tokens, H_kv, D)``, concatenated across
+        all requests in the batch.  Each rank writes its own cyclic-shard
+        slice -- the cache manager state on this rank tracks the rank's
+        own pages, so writing here uses the per-rank page indices that
+        ``prepare()`` already populated in ``metadata.paged_kv_indices``.
+
+        Uses ``flashinfer.page.append_paged_kv_cache`` with the standard
+        (batch_indices, positions) pair derived from the post-append
+        state via ``get_seq_lens`` + ``get_batch_indices_positions``.
+        Matches the pattern in
+        ``tensorrt_llm/_torch/attention_backend/flashinfer.py:1537``.
+        """
+        kv_cache_buf = metadata.kv_cache_manager.get_buffers(self.layer_idx, kv_layout="NHD")
+        page_size = metadata.kv_cache_manager.tokens_per_block
+        n = metadata.num_seqs
+
+        # qo_indptr: cumsum of per-request rank-local new tokens.
+        # Built on the fly because there's only one per-forward call here;
+        # if this becomes a hot path, promote to a stable buffer in
+        # __post_init__ and populate in prepare().
+        seq_lens_cuda = metadata.seq_lens_cuda
+        qo_indptr = torch.zeros(n + 1, dtype=torch.int32, device=seq_lens_cuda.device)
+        torch.cumsum(
+            seq_lens_cuda.to(torch.int32),
+            dim=0,
+            dtype=torch.int32,
+            out=qo_indptr[1:],
+        )
+
+        # seq_lens_total: post-append total per request, recovered from the
+        # page table that prepare() set up for the (cached + new) state.
+        seq_lens_total = flashinfer.get_seq_lens(
+            metadata.paged_kv_indptr[: n + 1],
+            metadata.paged_kv_last_page_len[:n],
+            page_size,
+        )
+
+        num_new_tokens = k.shape[0]
+        batch_indices, positions = flashinfer.get_batch_indices_positions(
+            qo_indptr, seq_lens_total, num_new_tokens
+        )
+
+        flashinfer.page.append_paged_kv_cache(
+            append_key=k.contiguous(),
+            append_value=v.contiguous(),
+            batch_indices=batch_indices,
+            positions=positions,
+            paged_kv_cache=kv_cache_buf,
+            kv_indices=metadata.paged_kv_indices,
+            kv_indptr=metadata.paged_kv_indptr[: n + 1],
+            kv_last_page_len=metadata.paged_kv_last_page_len[:n],
+            kv_layout="NHD",
+        )
 
     def _forward_single_request(
         self,
