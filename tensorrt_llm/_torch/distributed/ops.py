@@ -355,7 +355,11 @@ def attn2d_row_allgather(
         "attn2d_row_allgather requires CP type ATTN2D"
     group_boxed = mapping.attn2d_row_group_pg.boxed() if mpi_disabled(
     ) else None
-    return _allgather(input, mapping.attn2d_row_group, mapping.attn2d_row_rank,
+    # Position within the row group is col_idx (= attn2d_col_rank): the row
+    # group is [cp_group[row_idx + k * R] for k in range(C)], so the entry
+    # matching this rank lives at k = col_idx.  attn2d_row_rank is the row
+    # identifier (which row this rank is in), not the position-in-group.
+    return _allgather(input, mapping.attn2d_row_group, mapping.attn2d_col_rank,
                       group_boxed, dim, sizes)
 
 
@@ -375,7 +379,11 @@ def attn2d_col_allgather(
         "attn2d_col_allgather requires CP type ATTN2D"
     group_boxed = mapping.attn2d_col_group_pg.boxed() if mpi_disabled(
     ) else None
-    return _allgather(input, mapping.attn2d_col_group, mapping.attn2d_col_rank,
+    # Position within the col group is row_idx (= attn2d_row_rank): the col
+    # group is [cp_group[col_idx * R + k] for k in range(R)], so the entry
+    # matching this rank lives at k = row_idx.  attn2d_col_rank is the col
+    # identifier (which col this rank is in), not the position-in-group.
+    return _allgather(input, mapping.attn2d_col_group, mapping.attn2d_row_rank,
                       group_boxed, dim, sizes)
 
 
