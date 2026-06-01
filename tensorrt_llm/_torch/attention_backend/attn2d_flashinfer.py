@@ -77,7 +77,7 @@ if absent the backend assumes divisibility.
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import flashinfer
 import torch
@@ -276,6 +276,86 @@ class Attn2DFlashInferAttentionMetadata(AttentionMetadata):
             self.chunk_input_lens = torch.tensor(chunk_input_lens, dtype=torch.int32)
 
 
+def _cyclic_count(N: int, P: int, r: int) -> int:
+    """Count of positions ``{p : p%P == r, 0 <= p < N}``."""
+    if r >= N or N <= 0:
+        return 0
+    return (N - r + P - 1) // P
+
+
+def _first_chunk_pos(L_prev: int, P: int, r: int) -> int:
+    """Smallest position p with ``p%P == r`` and ``p >= L_prev``."""
+    return L_prev + ((r - L_prev) % P)
+
+
+def _build_q_sort_idx(
+    L_chunk: int,
+    L_prev: int,
+    R: int,
+    C: int,
+    row_idx: int,
+    new_counts_in_row: List[int],
+    device: torch.device,
+) -> torch.Tensor:
+    """Build sort_idx[m] = flat row-gather index for sorted-Q absolute position m.
+
+    Row-gather output is rank-major: rank ``c`` (cp_rank = c*R + row_idx)
+    contributes ``new_counts_in_row[c]`` entries.  Sorted Q is in absolute
+    position order with stride R starting at first_q = L_prev + ((row_idx -
+    L_prev) mod R).  This helper precomputes the permutation that maps
+    sorted index m to the flat row-gather index where that token lives.
+
+    Returns a CUDA int64 tensor of shape ``(sum(new_counts_in_row),)``.
+    """
+    P = R * C
+    L_new_per_row = sum(new_counts_in_row)
+    if L_new_per_row == 0:
+        return torch.empty(0, dtype=torch.int64, device=device)
+    first_q = L_prev + ((row_idx - L_prev) % R)
+    m = torch.arange(L_new_per_row, dtype=torch.int64)
+    p = first_q + m * R
+    c = ((p % P) - row_idx) // R
+    cp_rank_c = c * R + row_idx
+    first_pos_c = L_prev + ((cp_rank_c - L_prev) % P)
+    j = (p - first_pos_c) // P
+    offsets = torch.tensor([0] + list(new_counts_in_row[:-1]), dtype=torch.int64).cumsum(0)
+    return (offsets[c] + j).to(device)
+
+
+def _build_k_sort_idx(
+    L_total: int,
+    R: int,
+    C: int,
+    col_idx: int,
+    total_counts_in_col: List[int],
+    device: torch.device,
+) -> torch.Tensor:
+    """Build sort_idx[k] = flat col-gather index for sorted-K absolute position k.
+
+    Post-redistribute col-gather output is rank-major in the col group:
+    rank at row_idx_in_col contributes total_counts_in_col[row_idx_in_col]
+    entries (= L_local_total at source rank ``row_idx_in_col*C + col_idx``).
+    Sorted K is in absolute position order with stride C starting at col_idx.
+
+    Returns a CUDA int64 tensor of shape ``(sum(total_counts_in_col),)``.
+    """
+    P = R * C
+    L_k_per_col = sum(total_counts_in_col)
+    if L_k_per_col == 0:
+        return torch.empty(0, dtype=torch.int64, device=device)
+    k = torch.arange(L_k_per_col, dtype=torch.int64)
+    p = col_idx + k * C
+    # After redistribute, rank at row_idx_in_col holds positions with
+    # p%P == row_idx_in_col*C + col_idx.  Solve for row_idx_in_col:
+    row_idx_in_col = ((p % P) - col_idx) // C
+    # Within that rank, local index j: positions are
+    # row_idx_in_col*C + col_idx + j*P, so j = (p - that_first_pos) // P.
+    first_pos = row_idx_in_col * C + col_idx
+    j = (p - first_pos) // P
+    offsets = torch.tensor([0] + list(total_counts_in_col[:-1]), dtype=torch.int64).cumsum(0)
+    return (offsets[row_idx_in_col] + j).to(device)
+
+
 def _redistribute_kv_to_row_major(
     kv: torch.Tensor,
     *,
@@ -283,12 +363,16 @@ def _redistribute_kv_to_row_major(
     C: int,
     cp_rank: int,
     cp_group: List[int],
+    recv_count: Optional[int] = None,
 ) -> torch.Tensor:
     """Permute packed K/V across cp_group: column-major -> row-major cyclic.
 
-    Input ``kv`` is the packed tensor of shape ``(2, L_local, H_kv, D)``
-    with ``kv[0] = K`` and ``kv[1] = V``.  Returns the permuted packed
-    tensor (same shape and dtype) -- either ``kv`` itself when the
+    Input ``kv`` is the packed tensor of shape ``(L_local, 2, H_kv, D)``
+    with ``kv[:, 0]`` = K and ``kv[:, 1]`` = V.  The varying dim is dim 0
+    so asymmetric P2P (different shard counts at paired ranks for chunked
+    prefill) can override the recv tensor's dim 0 via ``recv_count``.
+    Returns the permuted packed tensor (shape ``(recv_count, 2, H_kv, D)``
+    when set, else same shape as ``kv``) -- either ``kv`` itself when the
     permutation is the identity, or a freshly allocated buffer filled
     via P2P from the source peer.
 
@@ -335,6 +419,7 @@ def _redistribute_kv_to_row_major(
         target_rank=cp_group[target],
         source_rank=cp_group[source],
         group=cp_group,
+        recv_count=recv_count,
     )
 
 
@@ -376,16 +461,6 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
             raise NotImplementedError(
                 f"Attn2DFlashInferAttention only supports CAUSAL mask, got "
                 f"{forward_args.attention_mask}."
-            )
-        # KV cache plumbing is wired through metadata, but the compute path
-        # still handles only initial-chunk prefill (no cached K/V).  Chunked /
-        # multi-turn prefill arrives in a later phase; until then, reject any
-        # request that has cached tokens on this rank.
-        if metadata.cached_lens_local is not None and int(metadata.cached_lens_local.sum()) > 0:
-            raise NotImplementedError(
-                "Attn2DFlashInferAttention does not yet support non-empty KV "
-                "cache (chunked / multi-turn prefill).  Got cached_lens_local "
-                f"= {metadata.cached_lens_local.tolist()}; expected all zeros."
             )
         if k is None or v is None:
             raise NotImplementedError(
@@ -434,13 +509,38 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
         else:
             total_lens = [local_len * P for local_len in seq_lens]
         assert len(total_lens) == len(seq_lens)
+        # Per-request chunk length (same on every rank).  None means
+        # initial-chunk prefill (chunk == total).
+        if metadata.chunk_input_lens is not None:
+            chunk_lens = metadata.chunk_input_lens.tolist()
+        else:
+            chunk_lens = list(total_lens)
+        assert len(chunk_lens) == len(seq_lens)
+        # Per-rank cached counts: 0 when no cache configured.
+        if metadata.cached_lens_local is not None:
+            cached_lens_list = metadata.cached_lens_local.tolist()
+        else:
+            cached_lens_list = [0] * len(seq_lens)
+
+        has_cache = metadata.kv_cache_manager is not None
 
         outputs = []
         offset = 0
-        for local_len, total_len in zip(seq_lens, total_lens):
-            q_local = q[offset : offset + local_len]
-            k_local = k[offset : offset + local_len]
-            v_local = v[offset : offset + local_len]
+        for req_idx, (local_new_len, total_len, chunk_len) in enumerate(
+            zip(seq_lens, total_lens, chunk_lens)
+        ):
+            L_local_cached = cached_lens_list[req_idx]
+            L_local_total = L_local_cached + local_new_len
+
+            q_local = q[offset : offset + local_new_len]
+            if has_cache:
+                # Read cached + new K/V from the paged cache (append wrote the
+                # new K/V to cache above, so reading total gives [old || new]).
+                k_local, v_local = self._materialize_kv_from_pages(metadata, req_idx, L_local_total)
+            else:
+                # No cache: total == new, use input args directly.
+                k_local = k[offset : offset + local_new_len]
+                v_local = v[offset : offset + local_new_len]
 
             outputs.append(
                 self._forward_single_request(
@@ -448,6 +548,8 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
                     k_local,
                     v_local,
                     L_total=total_len,
+                    L_chunk=chunk_len,
+                    L_local_cached=L_local_cached,
                     R=R,
                     C=C,
                     P=P,
@@ -457,9 +559,63 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
                     mapping=mapping,
                 )
             )
-            offset += local_len
+            offset += local_new_len
 
         return torch.cat(outputs, dim=0).reshape(-1, H_q * D)
+
+    def _materialize_kv_from_pages(
+        self,
+        metadata: Attn2DFlashInferAttentionMetadata,
+        req_idx: int,
+        L_local_total: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Extract this rank's cached + new K/V for one request from paged cache.
+
+        After ``_append_new_kv_to_cache`` has run, the cache contains this
+        rank's cyclic-shard slice of [0, L_total) for the request.  This
+        method materializes those ``L_local_total`` entries into a pair of
+        contiguous tensors for the subsequent mesh comm.
+
+        Returns ``(k, v)`` each of shape ``(L_local_total, H_kv, D)`` in
+        absolute-position order (per-rank cyclic order: r, r+P, r+2P, ...).
+        """
+        if L_local_total == 0:
+            H_kv = self.num_kv_heads
+            D = self.head_dim
+            dev = metadata.paged_kv_indices.device
+            # Match dtype of the cache buffer.
+            kv_cache_buf = metadata.kv_cache_manager.get_buffers(self.layer_idx, kv_layout="NHD")
+            return (
+                torch.empty(0, H_kv, D, dtype=kv_cache_buf.dtype, device=dev),
+                torch.empty(0, H_kv, D, dtype=kv_cache_buf.dtype, device=dev),
+            )
+
+        kv_cache_buf = metadata.kv_cache_manager.get_buffers(self.layer_idx, kv_layout="NHD")
+        page_size = metadata.kv_cache_manager.tokens_per_block
+        page_start = int(metadata.paged_kv_indptr[req_idx])
+        page_end = int(metadata.paged_kv_indptr[req_idx + 1])
+        num_pages = page_end - page_start
+        last_page_len = int(metadata.paged_kv_last_page_len[req_idx])
+
+        # NHD layout: (num_pages_total, 2, page_size, H_kv, D).  Gather this
+        # request's pages, then permute (page, slot) -> (page*page_size, ...).
+        page_ids = metadata.paged_kv_indices[page_start:page_end]
+        pages = kv_cache_buf[page_ids]  # (num_pages, 2, page_size, H_kv, D)
+        # Flatten (num_pages, page_size) into a linear token axis: dim order is
+        # (num_pages, page_size, 2, H_kv, D), then reshape.
+        flat = (
+            pages.permute(0, 2, 1, 3, 4)
+            .contiguous()
+            .view(num_pages * page_size, 2, *pages.shape[3:])
+        )
+        # Tokens in the last page may be partially filled.
+        valid_tokens = (num_pages - 1) * page_size + last_page_len
+        assert valid_tokens == L_local_total, (
+            f"page table inconsistent for req {req_idx}: derived "
+            f"{valid_tokens} but expected L_local_total={L_local_total}"
+        )
+        kv = flat[:L_local_total]  # (L_local_total, 2, H_kv, D)
+        return kv[:, 0].contiguous(), kv[:, 1].contiguous()
 
     def _append_new_kv_to_cache(
         self,
@@ -531,6 +687,8 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
         v: torch.Tensor,
         *,
         L_total: int,
+        L_chunk: int,
+        L_local_cached: int,
         R: int,
         C: int,
         P: int,
@@ -539,195 +697,222 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
         col_idx: int,
         mapping,
     ) -> torch.Tensor:
-        """Process one request's cyclic shard. Returns [L_local, H_q, D].
+        """Process one request's cyclic shard. Returns ``[L_local_new, H_q, D]``.
 
-        ``L_total`` is the request's total (un-sharded) length.  When
-        ``L_total % P != 0``, ranks ``r < L_total % P`` already hold one
-        extra real token; the rest pad up to ``ceil(L_total / P)`` with
-        one zero row.  Padding rows take "virtual" positions ``>= L_total``
-        so the natural causal mask excludes them from real-Q outputs,
-        and we slice them off the final output below.
+        Inputs:
+            q: this rank's new-chunk Q, shape ``(L_local_new, H_q, D)``.
+            k, v: this rank's cached + new K/V, shape ``(L_local_total,
+                H_kv, D)``, in absolute-position order
+                (``r, r+P, r+2P, ...``).  For initial-chunk prefill,
+                ``L_local_cached == 0`` and these are just the new K/V.
+
+        ``L_total`` is the request's full conversation length; ``L_chunk``
+        is the current-chunk length (so ``L_prev = L_total - L_chunk``
+        cached tokens globally).  All ranks see the same L_total and
+        L_chunk; per-rank counts derived via ``_cyclic_count``.
+
+        Uses variable-size collectives (allgatherv for row/col gather,
+        asymmetric P2P via ``recv_count`` for the K/V redistribute).
+        Sorted-position Q-split / K-split kernel calls with bottom-right
+        causal; the dummy-row trick adjusts the natural ``kv_len -
+        qo_len`` shift to the required mask shift (per-call ``diff in
+        {0, 1}`` -- asserted).
         """
-        L_local = q.shape[0]
-        L_local_padded = (L_total + P - 1) // P  # ceil(L_total / P)
-        pad_rows = L_local_padded - L_local
-        assert pad_rows in (0, 1), (
-            f"unexpected pad_rows={pad_rows} for L_total={L_total}, P={P}, "
-            f"L_local={L_local}; cyclic sharding can differ by at most 1."
+        L_local_new = q.shape[0]
+        L_local_total = k.shape[0]
+        assert L_local_total == L_local_cached + L_local_new, (
+            f"L_local_total ({L_local_total}) != cached ({L_local_cached}) + new ({L_local_new})"
         )
+        L_prev = L_total - L_chunk
         H_q, D = q.shape[1], q.shape[2]
-        H_kv = k.shape[1]
+        device = q.device
 
-        if pad_rows:
-            q = torch.cat([q, q.new_zeros(pad_rows, H_q, D)], dim=0)
-            k = torch.cat([k, k.new_zeros(pad_rows, H_kv, D)], dim=0)
-            v = torch.cat([v, v.new_zeros(pad_rows, H_kv, D)], dim=0)
-        # Below, ``L_local`` refers to the padded length; the original
-        # is preserved as ``L_local_unpadded`` for the final slice.
-        L_local_unpadded = L_local
-        L_local = L_local_padded
+        # Per-rank cyclic counts (CPU-side, scalar).
+        total_counts = [_cyclic_count(L_total, P, r) for r in range(P)]
+        cached_counts = [_cyclic_count(L_prev, P, r) for r in range(P)]
+        new_counts = [total_counts[r] - cached_counts[r] for r in range(P)]
+        # Sanity: this rank's counts match what the engine derived.
+        assert total_counts[cp_rank] == L_local_total
+        assert new_counts[cp_rank] == L_local_new
 
-        # --- 1) Row-gather Q: [L_local, H_q, D] -> [L_q = C*L_local, H_q, D].
+        # Row group: this row contains C ranks at cp_rank = c*R + row_idx
+        # for c in [0, C).  Per-rank Q size in row group = new_counts[c*R + row_idx].
+        sizes_row = [new_counts[c * R + row_idx] for c in range(C)]
+        L_q_per_row = sum(sizes_row)
+
+        # Col group AFTER redistribute: ranks at row_idx_in_col within col_idx;
+        # source for col rank (row_idx_in_col) = row_idx_in_col*C + col_idx.
+        # Per-rank K size in col group = total_counts[source].
+        sizes_col = [total_counts[row_idx_in_col * C + col_idx] for row_idx_in_col in range(R)]
+        L_k_per_col = sum(sizes_col)
+
+        # --- 1) Row-gather Q (variable sizes).
         if C > 1:
-            q_full = attn2d_row_allgather(q.contiguous(), mapping, dim=0)
+            q_full = attn2d_row_allgather(q.contiguous(), mapping, dim=0, sizes=sizes_row)
         else:
             q_full = q
+        # q_full shape: (L_q_per_row, H_q, D) in rank-major order.
 
-        # --- 2-3) Redistribute K/V (column-major -> row-major cyclic) and
-        # col-gather, packed end-to-end.  Result is source-rank-grouped
-        # K/V; step 4 re-layouts per path.
-        L_q = C * L_local
-        L_k = R * L_local
-
+        # --- 2-3) Redistribute K/V (col-major -> row-major cyclic) + col-gather.
+        # Restructure to put varying dim first: (L_local_total, 2, H_kv, D).
         if R > 1:
-            kv_send = torch.stack([k, v], dim=0).contiguous()
+            kv_send = torch.stack([k, v], dim=1).contiguous()  # (L_local_total, 2, H_kv, D)
+            source = (cp_rank % R) * C + (cp_rank // R)
+            recv_count = total_counts[source]
             kv_send = _redistribute_kv_to_row_major(
-                kv_send, R=R, C=C, cp_rank=cp_rank, cp_group=mapping.cp_group
-            )
-            # attn2d_col_allgather concatenates along dim 0; output is
-            # rank-major, so .view(R, 2, ...) yields the same layout that
-            # all_gather_into_tensor into a (R, 2, L_local, H_kv, D) buffer
-            # would have produced.
-            kv_recv = attn2d_col_allgather(kv_send, mapping, dim=0).view(R, 2, L_local, H_kv, D)
-        # R == 1: no redistribute or col-gather needed; k/v are already the
-        # sorted tensors used by the Q-split branch below.
+                kv_send,
+                R=R,
+                C=C,
+                cp_rank=cp_rank,
+                cp_group=mapping.cp_group,
+                recv_count=recv_count,
+            )  # (recv_count, 2, H_kv, D)
+            kv_recv = attn2d_col_allgather(kv_send, mapping, dim=0, sizes=sizes_col)
+            # kv_recv shape: (L_k_per_col, 2, H_kv, D) in rank-major (col) order.
+            k_col = kv_recv[:, 0].contiguous()
+            v_col = kv_recv[:, 1].contiguous()
+        else:
+            # R == 1: no redistribute or col-gather needed.
+            k_col = k
+            v_col = v
 
-        # --- 4) Local attention.  K/V layout is path-specific:
-        #   Q-split    -> full sorted (k_sorted, v_sorted) via one permute
-        #   K-split    -> per-u contiguous (K_u, V_u) views into one
-        #                 permute -- no second copy in the per-u loop
-        if C % R == 0:
-            # Q-split path (includes square mesh as s == 1).
-            # Each Q_t is the sorted Q at stride s, with positions
-            # advancing by C per index -- matching K.  Per-Q_t mask is
-            #   (k - m) * C <= t*R + row_idx - col_idx
-            # which is causal (RHS >= 0) or strict-causal (RHS < 0).
-            # Outputs cover disjoint Q positions -> no LSE merge across t.
-            if R > 1:
-                # (R, 2, L_local, H_kv, D) -> (2, L_local, R, H_kv, D)
-                # -> (2, L_k, H_kv, D).  Flat L_k index l*R + r maps to
-                # position (l*R + r)*C + col_idx; slicing dim 0 at 0/1
-                # gives contiguous K / V.
-                kv_sorted = kv_recv.permute(1, 2, 0, 3, 4).contiguous().view(2, L_k, H_kv, D)
-                k_sorted = kv_sorted[0]
-                v_sorted = kv_sorted[1]
-            else:
-                k_sorted = k
-                v_sorted = v
+        # --- 4) Sort Q and K by absolute position, then Q-split or K-split.
+        q_sort_idx = _build_q_sort_idx(L_chunk, L_prev, R, C, row_idx, sizes_row, device=device)
+        k_sort_idx = _build_k_sort_idx(L_total, R, C, col_idx, sizes_col, device=device)
+        sorted_q = q_full[q_sort_idx] if L_q_per_row > 0 else q_full
+        sorted_k = k_col[k_sort_idx] if L_k_per_col > 0 else k_col
+        sorted_v = v_col[k_sort_idx] if L_k_per_col > 0 else v_col
+
+        first_q_row = _first_chunk_pos(L_prev, R, row_idx)
+
+        if L_q_per_row == 0 or L_k_per_col == 0:
+            # Degenerate: nothing to compute.  Skip kernel calls.
+            output_sorted = sorted_q.new_zeros(L_q_per_row, H_q, D)
+            lse_sorted = sorted_q.new_full((L_q_per_row, H_q), float("-inf"), dtype=torch.float32)
+        elif C % R == 0:
+            # Q-split path: Q_t at stride s = C/R; full K.
             s = C // R
-            output_send = q.new_empty(R, s, L_local, H_q, D)
-            lse_send = q.new_empty(R, s, L_local, H_q, dtype=torch.float32)
-            q_full_view = q_full.view(C, L_local, H_q, D)
+            output_sorted = sorted_q.new_empty(L_q_per_row, H_q, D)
+            lse_sorted = sorted_q.new_empty(L_q_per_row, H_q, dtype=torch.float32)
             for t in range(s):
-                # q_full_view[t::s] selects R blocks at strided c indices;
-                # transpose puts the slow dim (L_local) before the stride
-                # dim (R), giving sorted Q_t order in the flat layout.
-                Q_t = q_full_view[t::s].transpose(0, 1).contiguous().view(L_k, H_q, D)
-                strict = (t * R + row_idx) < col_idx
-                if strict:
+                Q_t = sorted_q[t::s]
+                Q_t_count = Q_t.shape[0]
+                if Q_t_count == 0:
+                    continue
+                # Required mask shift: (k - m) <= floor((first_q + t*R - col_idx) / C).
+                # Python // is floor division (rounds to -inf).
+                required_shift = (first_q_row + t * R - col_idx) // C
+                natural_shift = L_k_per_col - Q_t_count
+                diff = natural_shift - required_shift
+                assert diff in (0, 1), (
+                    f"unexpected dummy count {diff} at (row={row_idx}, "
+                    f"col={col_idx}, t={t}) for L_prev={L_prev}, L_chunk={L_chunk}, "
+                    f"L_total={L_total}; natural={natural_shift}, required={required_shift}"
+                )
+                if diff == 1:
                     Q_in = torch.cat([Q_t, Q_t.new_zeros(1, H_q, D)], dim=0)
                 else:
                     Q_in = Q_t
                 out_t, lse_t = flashinfer.single_prefill_with_kv_cache(
                     Q_in,
-                    k_sorted,
-                    v_sorted,
+                    sorted_k,
+                    sorted_v,
                     causal=True,
                     kv_layout="NHD",
                     return_lse=True,
                 )
-                if strict:
+                if diff == 1:
                     out_t = out_t[:-1]
                     lse_t = lse_t[:-1]
-                # Write directly into the source-rank-grouped layout.
-                # out_t at sorted-Q_t index m' = i*R + k goes to
-                # output_send[k, t, i].
-                output_send[:, t] = out_t.view(L_local, R, H_q, D).transpose(0, 1)
-                lse_send[:, t] = lse_t.view(L_local, R, H_q).transpose(0, 1)
-            output = output_send.view(C * L_local, H_q, D)
-            lse = lse_send.view(C * L_local, H_q)
+                output_sorted[t::s] = out_t
+                lse_sorted[t::s] = lse_t
         elif R % C == 0:
-            # K-split path (R == C falls into the Q-split branch above,
-            # so here s >= 2 and R > 1).  Each K_u is the sorted K at
-            # stride s, with positions advancing by R per index --
-            # matching Q.  Per-K_u mask is
-            #   (k - m) * R <= row_idx - col_idx - u*C
-            # again clean causal / strict-causal.  Each call is a partial
-            # attention over a K-shard, so partials are LSE-merged
-            # across u.
+            # K-split path: full Q; K_u at stride s = R/C.  Each call is a
+            # partial attention; LSE-merge across u.
             s = R // C
-            # Fuse "split into K/V" with "interleave to sorted K_u order"
-            # into ONE permute+contiguous, then slice per-u contiguous
-            # views.  View as (C, s, ...) splits the R axis as (c_in_R,
-            # u) so r = c_in_R * s + u; permuting (u, t, l, c_in_R, h, d)
-            # and flattening (l, c_in_R) -> L_q gives sorted K_u order
-            # k'_u = l*C + c_in_R.  kv_by_u[u, t] is a contiguous (L_q,
-            # H_kv, D) view -- no extra copy in the per-u loop.
-            kv_by_u = (
-                kv_recv.view(C, s, 2, L_local, H_kv, D)
-                .permute(1, 2, 3, 0, 4, 5)
-                .contiguous()
-                .view(s, 2, L_q, H_kv, D)
-            )
-            q_sorted = (
-                q_full.view(C, L_local, H_q, D).transpose(0, 1).contiguous().view(L_q, H_q, D)
-            )
-            v_stack = q.new_empty(L_q, s, H_q, D)
-            s_stack = q.new_empty(L_q, s, H_q, dtype=torch.float32)
+            v_stack = sorted_q.new_empty(L_q_per_row, s, H_q, D)
+            s_stack = sorted_q.new_empty(L_q_per_row, s, H_q, dtype=torch.float32)
             for u in range(s):
-                strict = row_idx < (col_idx + u * C)
-                if strict:
-                    Q_in = torch.cat([q_sorted, q_sorted.new_zeros(1, H_q, D)], dim=0)
+                K_u = sorted_k[u::s]
+                V_u = sorted_v[u::s]
+                K_u_count = K_u.shape[0]
+                if K_u_count == 0:
+                    v_stack[:, u].zero_()
+                    s_stack[:, u].fill_(float("-inf"))
+                    continue
+                required_shift = (first_q_row - col_idx - u * C) // R
+                natural_shift = K_u_count - L_q_per_row
+                diff = natural_shift - required_shift
+                assert diff in (0, 1), (
+                    f"unexpected dummy count {diff} at (row={row_idx}, "
+                    f"col={col_idx}, u={u}) for L_prev={L_prev}, L_chunk={L_chunk}, "
+                    f"L_total={L_total}; natural={natural_shift}, required={required_shift}"
+                )
+                if diff == 1:
+                    Q_in = torch.cat([sorted_q, sorted_q.new_zeros(1, H_q, D)], dim=0)
                 else:
-                    Q_in = q_sorted
+                    Q_in = sorted_q
                 out_u, lse_u = flashinfer.single_prefill_with_kv_cache(
                     Q_in,
-                    kv_by_u[u, 0],
-                    kv_by_u[u, 1],
+                    K_u,
+                    V_u,
                     causal=True,
                     kv_layout="NHD",
                     return_lse=True,
                 )
-                if strict:
+                if diff == 1:
                     out_u = out_u[:-1]
                     lse_u = lse_u[:-1]
                 v_stack[:, u] = out_u
                 s_stack[:, u] = lse_u
             output_sorted, lse_sorted = flashinfer.merge_states(v_stack, s_stack)
-            # Inverse interleave both back to source-rank-grouped order
-            # so the row-group all_to_all below picks them up unchanged.
-            output = (
-                output_sorted.view(L_local, C, H_q, D)
-                .transpose(0, 1)
-                .contiguous()
-                .view(L_q, H_q, D)
-            )
-            lse = lse_sorted.view(L_local, C, H_q).transpose(0, 1).contiguous().view(L_q, H_q)
-        # output: [L_q, H_q, D] in source-rank-grouped order;
-        # lse:    [L_q, H_q] (natural log).
+        # output_sorted: (L_q_per_row, H_q, D) in absolute-position sorted order.
+        # lse_sorted:    (L_q_per_row, H_q).
+
+        # Unsort: scatter back to row-gather rank-major layout.
+        if L_q_per_row > 0:
+            output = sorted_q.new_empty(L_q_per_row, H_q, D)
+            lse = sorted_q.new_empty(L_q_per_row, H_q, dtype=torch.float32)
+            output[q_sort_idx] = output_sorted
+            lse[q_sort_idx] = lse_sorted
+        else:
+            output = output_sorted
+            lse = lse_sorted
 
         # --- 5) Row-group all_to_all + LSE-merge of the C partials.
         if C > 1:
-            # output: [C*L_local, H_q, D] grouped by destination col_idx
-            # in the row group.  After all_to_all, o_recv[c, i] is the
-            # partial from source col_idx=c for this rank's local token i.
-            # attn2d_row_alltoall takes a multi-list input (C tensors per
-            # list); we pass [o_chunks..., lse_chunks...] and unpack two
-            # outputs.
-            o_chunks = list(output.view(C, L_local, H_q, D).contiguous().unbind(0))
-            lse_chunks = list(lse.view(C, L_local, H_q).contiguous().unbind(0))
+            # Pad each sender chunk to max(sizes_row) so the alltoall has
+            # uniform shape across the C senders.  Truncate received chunks
+            # back to this rank's real size before merge.  Padding rows
+            # carry LSE = -inf so merge_states ignores them.
+            max_sz = max(sizes_row) if sizes_row else 0
+            if max_sz == 0:
+                return output  # empty
+            o_chunks: List[torch.Tensor] = []
+            lse_chunks: List[torch.Tensor] = []
+            cum = 0
+            for c in range(C):
+                sz = sizes_row[c]
+                o_c = output[cum : cum + sz]
+                lse_c = lse[cum : cum + sz]
+                if sz < max_sz:
+                    pad = max_sz - sz
+                    o_c = torch.cat([o_c, o_c.new_zeros(pad, H_q, D)], dim=0)
+                    lse_c = torch.cat([lse_c, lse_c.new_full((pad, H_q), float("-inf"))], dim=0)
+                o_chunks.append(o_c.contiguous())
+                lse_chunks.append(lse_c.contiguous())
+                cum += sz
             o_recv, lse_recv = attn2d_row_alltoall(o_chunks + lse_chunks, mapping)
-            # o_recv:   (C, L_local, H_q, D)
-            # lse_recv: (C, L_local, H_q)
+            # o_recv: (C, max_sz, H_q, D); lse_recv: (C, max_sz, H_q).
 
-            # merge_states wants (seq_len, num_states, ...).  C is the
-            # state count; L_local is the seq_len for this rank.
+            # Truncate to this rank's real chunk size.
+            real_sz = sizes_row[col_idx]
+            o_recv = o_recv[:, :real_sz]
+            lse_recv = lse_recv[:, :real_sz]
             v_stack = o_recv.permute(1, 0, 2, 3).contiguous()
             s_stack = lse_recv.permute(1, 0, 2).contiguous()
             out_merged, _ = flashinfer.merge_states(v_stack, s_stack)
-            # Slice off padded rows: those carried virtual positions
-            # >= L_total and were ignored by the causal mask.
-            return out_merged[:L_local_unpadded]
+            return out_merged
 
-        # C == 1: this rank's L_local tokens are already complete.
-        return output[:L_local_unpadded]
+        # C == 1: this rank's tokens are already complete.
+        return output
