@@ -655,14 +655,21 @@ def _run_attn2d_chunked_check(
     assert L_chunk_1 > 0 and L_chunk_2 > 0, (
         f"both chunks must be non-empty: L={L}, L_chunk_1={L_chunk_1}"
     )
-    # Keep the chunk boundary P-aligned for this test so per-rank counts stay
-    # clean (the variable-size collectives handle non-aligned boundaries too,
-    # but that's covered by a separate test).
-    assert L_chunk_1 % P == 0, f"chunk boundary L_chunk_1={L_chunk_1} must be a multiple of P={P}"
 
-    L_local = L // P  # uniform under L % P == 0
-    L_local_chunk_1 = L_chunk_1 // P
-    L_local_chunk_2 = L_chunk_2 // P
+    # Per-rank cyclic counts: when L_chunk_1 mod P != 0, the per-rank chunk
+    # split is uneven; chunk 2's L_prev = L_chunk_1 is then not a multiple of
+    # P either, so the backend's first_q[row_idx] formula picks up a non-zero
+    # rotation and the kernel-call diff (natural_shift - required_shift) goes
+    # through the full classification (instead of staying = 0 for the
+    # P-aligned case).  L itself stays divisible by P, so the cp_allgather at
+    # the test's tail still sees uniform per-rank L_local.
+    L_local = (L - rank + P - 1) // P  # cyclic count on this rank
+    if rank < L_chunk_1:
+        L_local_chunk_1 = (L_chunk_1 - rank + P - 1) // P
+    else:
+        L_local_chunk_1 = 0
+    L_local_chunk_2 = L_local - L_local_chunk_1
+    assert L_local_chunk_2 >= 0
     hidden = num_heads * head_dim
     kv_hidden = num_kv_heads * head_dim
 
@@ -812,8 +819,16 @@ def _entrypoint_chunked(
 #   (2, 2): square mesh, Q-split degenerate s=1 (most cases).
 #   (4, 2): K-split with s=2 (verifies LSE-merge across u under chunked prefill).
 #   (2, 4): Q-split with s=2 (verifies per-t shift derivation under chunked prefill).
+#
+# chunk_offset axis: amount added to L // 2 to pick the chunk-1 boundary.
+#   0: P-aligned -- uniform per-rank chunk counts, L_prev mod P == 0 for chunk 2.
+#   1: non-aligned by 1 -- exercises variable-size allgatherv across the row /
+#      col groups (per-rank chunk-1 counts differ by 1) and a non-zero L_prev
+#      mod P in chunk 2 (so the backend's first_q[row_idx] rotation kicks in
+#      and the kernel diff classification is non-trivial).
 @pytest.mark.parametrize("R,C", [(2, 2), (4, 2), (2, 4)])
-def test_attn2d_flashinfer_chunked_prefill(R, C):
+@pytest.mark.parametrize("chunk_offset", [0, 1])
+def test_attn2d_flashinfer_chunked_prefill(R, C, chunk_offset):
     """Two-chunk prefill (cache write + read) matches single-shot SDPA.
 
     The first forward processes chunk 1 with empty cache; new K/V is
@@ -823,21 +838,23 @@ def test_attn2d_flashinfer_chunked_prefill(R, C):
     ``kv_len > qo_len`` (chunk 2 attends to both chunks).  Concatenating
     the two chunks' outputs in cyclic-shard order must match the
     single-shot ATTN2D / full-causal SDPA reference.
+
+    chunk_offset=0 picks a P-aligned boundary; chunk_offset=1 picks a
+    boundary off by one token, which stresses variable-size allgatherv +
+    a non-zero L_prev mod P in the chunk 2 forward.
     """
     pytest.importorskip("flashinfer")
     P = R * C
     if torch.cuda.device_count() < P:
         pytest.skip(f"needs {P} CUDA devices, have {torch.cuda.device_count()}")
 
-    # P-aligned L and chunk boundary so per-rank counts are uniform.  This
-    # is the cleanest chunked-prefill case; non-aligned boundaries exercise
-    # the variable-size collectives more aggressively and are deferred to a
-    # follow-up test.
+    # L stays divisible by P so the final cp_allgather + slice in the test
+    # harness sees uniform per-rank L_local; only the chunk boundary varies.
     L = ((max(64, 8 * P) + P - 1) // P) * P
-    L_chunk_1 = L // 2
+    L_chunk_1 = L // 2 + chunk_offset
     head_dim = 64
     dtype_name = "bfloat16"
-    seed = 0xC04ED
+    seed = 0xC04ED + chunk_offset
     num_heads, num_kv_heads = 4, 4
 
     args = (P, R, C, L, L_chunk_1, num_heads, num_kv_heads, head_dim, dtype_name, seed)
