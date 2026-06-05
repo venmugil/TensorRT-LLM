@@ -501,8 +501,9 @@ class Attention(nn.Module):
             tp_size = 1
 
         if self.mapping.cp_size > 1:
-            assert self.mapping.has_cp_helix(
-            ), f"CP type must be HELIX for Attention, but got {self.mapping.cp_config['cp_type']}."
+            assert self.mapping.has_cp_helix() or self.mapping.has_cp_attn2d(
+            ), (f"CP type must be HELIX or ATTN2D for Attention, but got "
+                f"{self.mapping.cp_config['cp_type']}.")
 
         mapping = Mapping(
             world_size=dp_size * tp_size * pp_size * cp_size,
@@ -517,9 +518,11 @@ class Attention(nn.Module):
         self.tp_size = tp_size
         self.cp_size = cp_size
         self.tp_rank = mapping.tp_rank
-        assert self.num_heads % (tp_size * cp_size) == 0
+        # HELIX shards heads across CP ranks; ATTN2D distributes tokens instead.
+        head_cp_size = cp_size if self.mapping.has_cp_helix() else 1
+        assert self.num_heads % (tp_size * head_cp_size) == 0
         self.num_heads = self.num_heads // tp_size
-        self.num_heads_tp_cp = self.num_heads // cp_size
+        self.num_heads_tp_cp = self.num_heads // head_cp_size
         self.num_key_value_heads = (self.num_key_value_heads + tp_size -
                                     1) // tp_size
         self.q_size = self.num_heads * self.head_dim
@@ -563,12 +566,17 @@ class Attention(nn.Module):
 
         # For Helix CP, combine TP and CP for the output projection so each
         # rank's o_proj input is num_heads_tp_cp * head_dim.
+        # For ATTN2D, CP is handled inside the attention backend so o_proj
+        # uses TP only (same as the no-CP case).
+        o_proj_tp_size = tp_size * (cp_size
+                                    if self.mapping.has_cp_helix() else 1)
+        o_proj_world_size = dp_size * o_proj_tp_size * pp_size
         mapping_o = Mapping(
-            world_size=dp_size * tp_size * pp_size * cp_size,
-            tp_size=tp_size * cp_size,
+            world_size=o_proj_world_size,
+            tp_size=o_proj_tp_size,
             pp_size=pp_size * dp_size,
             cp_size=1,
-            rank=self.mapping.rank,
+            rank=self.mapping.rank % o_proj_world_size,
             gpus_per_node=self.mapping.gpus_per_node,
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
@@ -594,6 +602,10 @@ class Attention(nn.Module):
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
+        if self.mapping.has_cp_attn2d():
+            # ATTN2D handles token sharding inside its own backend; override
+            # the configured backend so create_attention selects it below.
+            self.attn_backend = "ATTN2D"
 
         sparse_attn_cfg = config.sparse_attention_config
         sparse_params = (sparse_attn_cfg.to_sparse_params(

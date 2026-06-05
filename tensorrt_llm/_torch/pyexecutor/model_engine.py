@@ -568,6 +568,11 @@ class PyTorchModelEngine(ModelEngine):
         self.get_runtime_tokens_per_gen_step = spec_config.get_runtime_tokens_per_gen_step if spec_config is not None else lambda runtime_draft_len: 1
 
         self.spec_metadata = None
+        if self.mapping.has_cp_attn2d():
+            # ATTN2D requires its own metadata type; override the backend so
+            # metadata construction below uses Attn2DFlashInferAttentionMetadata.
+            self.attn_backend = get_attention_backend("ATTN2D")
+
         if self.is_spec_decode:
             if not self.is_draft_model:
                 update_spec_config_from_loaded_model(self.spec_config,
@@ -3418,18 +3423,18 @@ class PyTorchModelEngine(ModelEngine):
                 (not getattr(request, "is_dummy", False)
                  or getattr(request, "py_encoder_output", None) is not None))
             if _has_cp_attn2d:
-                # ATTN2D's "total" means the *cumulative K range so far*
-                # (= L_prev + L_chunk), not the full conversation length:
-                # the kernel's mask only cares about positions [0, L_prev +
-                # L_chunk).  Full conversation length leaks future-chunk
-                # positions into the cyclic count math and breaks the
-                # mesh-comm size derivation.
-                attn2d_total_input_lens.append(begin_compute +
-                                               request.context_chunk_size)
-                # Current-chunk global length: how many new (un-cached)
-                # tokens this iteration covers across the conversation,
-                # before per-rank cyclic sharding.
-                attn2d_chunk_input_lens.append(request.context_chunk_size)
+                # ATTN2D needs GLOBAL (unsharded) lengths: begin_compute and
+                # context_chunk_size are LOCAL (per-rank cyclic shard counts).
+                # Multiply by cp_size to recover the global count (exact when
+                # cp_size divides the per-chunk global token count; for
+                # non-chunked prefill context_chunk_size==seqlen_this_rank_cp
+                # and the product equals total_input_len_cp when divisible).
+                cp_size_val = self.mapping.cp_size
+                global_chunk = request.context_chunk_size * cp_size_val
+                global_begin = begin_compute * cp_size_val
+                global_total = global_begin + global_chunk
+                attn2d_total_input_lens.append(global_total)
+                attn2d_chunk_input_lens.append(global_chunk)
 
             # Embed mask is required only for partial iterations (chunked
             # prefill or KV-cache reuse); full-prefill degrades gracefully.

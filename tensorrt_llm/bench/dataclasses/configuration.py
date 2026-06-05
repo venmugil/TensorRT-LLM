@@ -52,6 +52,8 @@ class RuntimeConfig(BaseModel):
             self.mapping["pp_size"],
             "tensor_parallel_size":
             self.mapping["tp_size"],
+            "context_parallel_size":
+            self.mapping.get("cp_size", 1),
             "gpus_per_node":
             self.mapping["gpus_per_node"],
             "moe_expert_parallel_size":

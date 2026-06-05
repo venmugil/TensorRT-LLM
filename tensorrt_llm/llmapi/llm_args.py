@@ -1448,6 +1448,14 @@ class CpConfig(StrictBaseModel):
         default=None, description="Anchor size for STAR attention.")
     block_size: Optional[int] = Field(
         default=None, description="Block size for STAR attention.")
+    row_size: Optional[int] = Field(
+        default=None,
+        description=
+        "Row dimension of the ATTN2D mesh (R). R*C must equal cp_size.")
+    col_size: Optional[int] = Field(
+        default=None,
+        description=
+        "Col dimension of the ATTN2D mesh (C). R*C must equal cp_size.")
 
     @field_validator("cp_type", mode="before")
     @classmethod
