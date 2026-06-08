@@ -129,8 +129,11 @@ class Attn2DFlashInferAttentionMetadata(AttentionMetadata):
     ``chunk_input_lens`` is ``None`` the backend treats every request
     as initial-chunk (``L_chunk == L_total``).
 
-    If ``total_input_lens`` is ``None``, the backend falls back to the
-    divisible-L assumption and ``L_total = seq_lens * cp_size``.
+    ``total_input_lens`` must be set via ``update_attn2d_param`` before
+    ``forward()``; ``None`` triggers an assertion error.  A per-rank fallback
+    (``local_len * P``) would silently produce different ``L_total`` values
+    on different ranks whenever ``L_total % cp_size != 0``, breaking
+    the mesh-comm size derivation.
 
     Paged-KV state (``paged_kv_indices``, ``paged_kv_indptr``,
     ``paged_kv_last_page_len``, ``workspace_buffer``) is allocated in
@@ -502,12 +505,18 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
             self._append_new_kv_to_cache(k, v, metadata)
 
         seq_lens = metadata.seq_lens.tolist()
-        # Per-request total length (same on every rank).  When None, fall
-        # back to the divisibility assumption L_total = L_local * P.
-        if metadata.total_input_lens is not None:
-            total_lens = metadata.total_input_lens.tolist()
-        else:
-            total_lens = [local_len * P for local_len in seq_lens]
+        # Per-request total (global, un-sharded) length -- must be set by the
+        # engine via update_attn2d_param before forward().  A per-rank fallback
+        # of local_len * P is wrong when L_total % P != 0: ranks with the extra
+        # cyclic token would derive a different L_total than ranks without it,
+        # breaking the mesh-comm size math (total_counts must agree across all
+        # ranks).
+        assert metadata.total_input_lens is not None, (
+            "Attn2DFlashInferAttentionMetadata.total_input_lens must be set "
+            "before forward() -- call update_attn2d_param() from the engine's "
+            "prepare-inputs path."
+        )
+        total_lens = metadata.total_input_lens.tolist()
         assert len(total_lens) == len(seq_lens)
         # Per-request chunk length (same on every rank).  None means
         # initial-chunk prefill (chunk == total).
