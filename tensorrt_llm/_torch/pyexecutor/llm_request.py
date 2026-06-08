@@ -727,6 +727,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.seqlen_this_rank_cp = self.prompt_len
         self.total_input_len_cp = self.prompt_len
         self.py_helix_is_inactive_rank = False
+        # ATTN2D chunked-prefill: global (unsharded) cumulative token count at
+        # the START of the current pass.  Initialised to 0; updated to
+        # global_total after each forward pass so the next pass can use it as
+        # global_begin without recomputing from local * cp_size.
+        self.attn2d_global_context_position = 0
         self.py_batch_idx = None
         self.py_draft_pages_allocated = 0
         self.py_rewind_len = 0

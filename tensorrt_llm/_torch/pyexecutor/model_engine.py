@@ -3423,16 +3423,34 @@ class PyTorchModelEngine(ModelEngine):
                 (not getattr(request, "is_dummy", False)
                  or getattr(request, "py_encoder_output", None) is not None))
             if _has_cp_attn2d:
-                # ATTN2D needs GLOBAL (unsharded) lengths: begin_compute and
-                # context_chunk_size are LOCAL (per-rank cyclic shard counts).
-                # Multiply by cp_size to recover the global count (exact when
-                # cp_size divides the per-chunk global token count; for
-                # non-chunked prefill context_chunk_size==seqlen_this_rank_cp
-                # and the product equals total_input_len_cp when divisible).
+                # ATTN2D needs GLOBAL (unsharded) lengths, identical on every
+                # rank.  begin_compute and context_chunk_size are LOCAL cyclic-
+                # shard counts; multiplying by cp_size is wrong when
+                # L_total % cp_size != 0 because ranks with the extra cyclic
+                # token compute a different product than ranks without it.
+                #
+                # global_begin: tracked on the request across passes so each
+                #   pass inherits the exact global cursor from the previous one
+                #   (stored as attn2d_global_context_position; 0 on first pass).
+                #
+                # global_total: for the LAST pass use total_input_len_cp (exact,
+                #   same on every rank, set at request creation from the unsharded
+                #   prompt length).  For intermediate passes, global_chunk =
+                #   context_chunk_size * cp_size is approximate (off by <P) when
+                #   the chunk boundary is not a P-multiple, but global_begin is
+                #   exact since it was snapped from total_input_len_cp at the end
+                #   of the preceding last-chunk pass or was 0 at pass 0.
                 cp_size_val = self.mapping.cp_size
-                global_chunk = request.context_chunk_size * cp_size_val
-                global_begin = begin_compute * cp_size_val
-                global_total = global_begin + global_chunk
+                global_begin = request.attn2d_global_context_position
+                is_last_chunk = (begin_compute + request.context_chunk_size
+                                 >= request.seqlen_this_rank_cp)
+                if is_last_chunk:
+                    global_total = request.total_input_len_cp
+                else:
+                    global_chunk = request.context_chunk_size * cp_size_val
+                    global_total = global_begin + global_chunk
+                global_chunk = global_total - global_begin
+                request.attn2d_global_context_position = global_total
                 attn2d_total_input_lens.append(global_total)
                 attn2d_chunk_input_lens.append(global_chunk)
 
