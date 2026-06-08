@@ -661,8 +661,9 @@ def _run_attn2d_chunked_check(
     # P either, so the backend's first_q[row_idx] formula picks up a non-zero
     # rotation and the kernel-call diff (natural_shift - required_shift) goes
     # through the full classification (instead of staying = 0 for the
-    # P-aligned case).  L itself stays divisible by P, so the cp_allgather at
-    # the test's tail still sees uniform per-rank L_local.
+    # P-aligned case).  When L mod P != 0, ranks r < L%P have one extra token;
+    # _gather_full_output handles this by padding each rank's output to
+    # L_max = ceil(L/P) before the cp_allgather.
     L_local = (L - rank + P - 1) // P  # cyclic count on this rank
     if rank < L_chunk_1:
         L_local_chunk_1 = (L_chunk_1 - rank + P - 1) // P
@@ -765,16 +766,18 @@ def _run_attn2d_chunked_check(
     out_c2 = backend.forward(q_local_c2, k_local_c2, v_local_c2, md2, forward_args=forward_args)
     assert out_c2.shape[0] == L_local_chunk_2
 
-    # Concatenate chunk outputs in cyclic order (== absolute-position order
-    # since L mod P == 0 makes the shard contiguous in absolute positions).
+    # Concatenate chunk outputs in cyclic order (chunk 1 positions precede
+    # chunk 2 positions in absolute order, so cyclic order is preserved).
     out_local = torch.cat([out_c1, out_c2], dim=0)
     assert out_local.shape[0] == L_local
 
     # Gather and compare against single-GPU full-causal SDPA.
+    # Use ceil(L/P) as L_max so that ranks with L_local < ceil(L/P) are
+    # padded correctly when L % P != 0.
     out_full = _gather_full_output(
         out_local,
         L=L,
-        L_max=L_local,
+        L_max=(L + P - 1) // P,
         hidden=hidden,
         P=P,
         dtype=dtype,
@@ -826,9 +829,16 @@ def _entrypoint_chunked(
 #      col groups (per-rank chunk-1 counts differ by 1) and a non-zero L_prev
 #      mod P in chunk 2 (so the backend's first_q[row_idx] rotation kicks in
 #      and the kernel diff classification is non-trivial).
+#
+# L_extra axis: whether the total sequence length is P-divisible.
+#   0: L divisible by P -- uniform per-rank L_local; baseline case.
+#   1: L = L_base + 1 -- L mod P != 0; ranks r < 1 have one extra token.
+#      Stresses the global-total derivation in model_engine.py (the last-chunk
+#      snap to total_input_len_cp) and the per-rank padding in _gather_full_output.
 @pytest.mark.parametrize("R,C", [(2, 2), (4, 2), (2, 4)])
 @pytest.mark.parametrize("chunk_offset", [0, 1])
-def test_attn2d_flashinfer_chunked_prefill(R, C, chunk_offset):
+@pytest.mark.parametrize("L_extra", [0, 1])
+def test_attn2d_flashinfer_chunked_prefill(R, C, chunk_offset, L_extra):
     """Two-chunk prefill (cache write + read) matches single-shot SDPA.
 
     The first forward processes chunk 1 with empty cache; new K/V is
@@ -842,19 +852,23 @@ def test_attn2d_flashinfer_chunked_prefill(R, C, chunk_offset):
     chunk_offset=0 picks a P-aligned boundary; chunk_offset=1 picks a
     boundary off by one token, which stresses variable-size allgatherv +
     a non-zero L_prev mod P in the chunk 2 forward.
+
+    L_extra=0 keeps L divisible by P (uniform per-rank shard sizes);
+    L_extra=1 makes L mod P == 1, so rank 0 has one extra token and the
+    backend must derive a consistent global total via the last-chunk snap
+    rather than multiplying a local count by P.
     """
     pytest.importorskip("flashinfer")
     P = R * C
     if torch.cuda.device_count() < P:
         pytest.skip(f"needs {P} CUDA devices, have {torch.cuda.device_count()}")
 
-    # L stays divisible by P so the final cp_allgather + slice in the test
-    # harness sees uniform per-rank L_local; only the chunk boundary varies.
-    L = ((max(64, 8 * P) + P - 1) // P) * P
+    L_base = ((max(64, 8 * P) + P - 1) // P) * P
+    L = L_base + L_extra
     L_chunk_1 = L // 2 + chunk_offset
     head_dim = 64
     dtype_name = "bfloat16"
-    seed = 0xC04ED + chunk_offset
+    seed = 0xC04ED + chunk_offset + L_extra * 0x100
     num_heads, num_kv_heads = 4, 4
 
     args = (P, R, C, L, L_chunk_1, num_heads, num_kv_heads, head_dim, dtype_name, seed)
