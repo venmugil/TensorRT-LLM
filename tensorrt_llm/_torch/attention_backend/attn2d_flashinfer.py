@@ -77,6 +77,7 @@ if absent the backend assumes divisibility.
 """
 
 from dataclasses import dataclass, field
+from itertools import accumulate
 from typing import List, Optional, Tuple
 
 import flashinfer
@@ -448,6 +449,10 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
             quant_config=quant_config,
             **kwargs,
         )
+        # Lazily allocated on first use (needs CUDA device).
+        self._ragged_prefill_wrapper: Optional[flashinfer.BatchPrefillWithRaggedKVCacheWrapper] = (
+            None
+        )
 
     def forward(
         self,
@@ -649,26 +654,24 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
                 k_rank_cum[rr] += sizes_col_all[i][rr]
 
         # ------------------------------------------------------------------ #
-        # 4) Per-request kernel calls (sort + Q/K-split + unsort).            #
-        # Collectives are already done; this is purely local GPU work.        #
-        # output_all[i]: (L_q_per_row_i, H_q, D) in rank-major order.        #
-        # lse_all[i]:    (L_q_per_row_i, H_q).                                #
+        # 4a) Per-request extraction and sort (no FlashInfer calls yet).      #
         # ------------------------------------------------------------------ #
-        output_all: List[torch.Tensor] = []
-        lse_all: List[torch.Tensor] = []
+        sorted_q_list: List[torch.Tensor] = []
+        sorted_k_list: List[torch.Tensor] = []
+        sorted_v_list: List[torch.Tensor] = []
+        q_sort_idx_list: List[torch.Tensor] = []
+        first_q_row_list: List[int] = []
 
         for i in range(B):
             L_q_i = L_q_per_row_all[i]
             L_k_i = L_k_per_col_all[i]
 
-            # Extract this request's Q from the gathered batch (C slice+cat ops).
             q_parts = [
                 q_gathered[q_req_starts[i][c] : q_req_starts[i][c] + sizes_row_all[i][c]]
                 for c in range(C)
             ]
             q_full_i = torch.cat(q_parts, dim=0) if C > 1 else q_parts[0]
 
-            # Extract K and V (R slice+cat ops each).
             k_parts = [
                 k_col_batch[k_req_starts[i][rr] : k_req_starts[i][rr] + sizes_col_all[i][rr]]
                 for rr in range(R)
@@ -690,34 +693,55 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
             sorted_k = k_col_i[k_sort_idx] if L_k_i > 0 else k_col_i
             sorted_v = v_col_i[k_sort_idx] if L_k_i > 0 else v_col_i
 
-            first_q_row = _first_chunk_pos(L_prev_all[i], R, row_idx)
-            output_sorted_i, lse_sorted_i = self._compute_attention_sorted(
-                sorted_q,
-                sorted_k,
-                sorted_v,
-                L_q=L_q_i,
-                L_k=L_k_i,
-                H_q=H_q,
-                D=D,
-                first_q_row=first_q_row,
-                col_idx=col_idx,
-                L_prev=L_prev_all[i],
-                L_chunk=chunk_lens[i],
-                L_total=total_lens[i],
-                row_idx=row_idx,
-                R=R,
-                C=C,
-            )
+            sorted_q_list.append(sorted_q)
+            sorted_k_list.append(sorted_k)
+            sorted_v_list.append(sorted_v)
+            q_sort_idx_list.append(q_sort_idx)
+            first_q_row_list.append(_first_chunk_pos(L_prev_all[i], R, row_idx))
 
+        # ------------------------------------------------------------------ #
+        # 4b) Batched attention: s rounds of B-request batch_prefill calls.   #
+        # Reduces B*s individual single_prefill calls to s batch calls.       #
+        # output_sorted_list[i]: (L_q_i, H_q, D); lse_sorted_list[i]: same   #
+        # but (L_q_i, H_q) -- both in absolute-position sorted order.        #
+        # ------------------------------------------------------------------ #
+        output_sorted_list, lse_sorted_list = self._compute_attention_sorted_batch(
+            sorted_q_list,
+            sorted_k_list,
+            sorted_v_list,
+            L_q_list=L_q_per_row_all,
+            L_k_list=L_k_per_col_all,
+            first_q_row_list=first_q_row_list,
+            L_prev_list=L_prev_all,
+            L_chunk_list=chunk_lens,
+            L_total_list=total_lens,
+            H_q=H_q,
+            D=D,
+            R=R,
+            C=C,
+            row_idx=row_idx,
+            col_idx=col_idx,
+            device=device,
+        )
+
+        # ------------------------------------------------------------------ #
+        # 4c) Unsort per request.                                             #
+        # output_all[i]: (L_q_per_row_i, H_q, D) in rank-major order.        #
+        # lse_all[i]:    (L_q_per_row_i, H_q).                                #
+        # ------------------------------------------------------------------ #
+        output_all: List[torch.Tensor] = []
+        lse_all: List[torch.Tensor] = []
+
+        for i in range(B):
+            L_q_i = L_q_per_row_all[i]
             if L_q_i > 0:
-                output_i = sorted_q.new_empty(L_q_i, H_q, D)
-                lse_i = sorted_q.new_empty(L_q_i, H_q, dtype=torch.float32)
-                output_i[q_sort_idx] = output_sorted_i
-                lse_i[q_sort_idx] = lse_sorted_i
+                output_i = sorted_q_list[i].new_empty(L_q_i, H_q, D)
+                lse_i = sorted_q_list[i].new_empty(L_q_i, H_q, dtype=torch.float32)
+                output_i[q_sort_idx_list[i]] = output_sorted_list[i]
+                lse_i[q_sort_idx_list[i]] = lse_sorted_list[i]
             else:
-                output_i = output_sorted_i
-                lse_i = lse_sorted_i
-
+                output_i = output_sorted_list[i]
+                lse_i = lse_sorted_list[i]
             output_all.append(output_i)
             lse_all.append(lse_i)
 
@@ -781,6 +805,258 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
 
         # C == 1: tokens are already complete per request, just cat.
         return torch.cat(output_all, dim=0).reshape(-1, H_q * D)
+
+    def _get_ragged_prefill_wrapper(
+        self,
+        device: torch.device,
+    ) -> flashinfer.BatchPrefillWithRaggedKVCacheWrapper:
+        """Return (and lazily create) the shared ragged-prefill wrapper."""
+        if self._ragged_prefill_wrapper is None:
+            workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device=device)
+            self._ragged_prefill_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+                workspace, kv_layout="NHD"
+            )
+        return self._ragged_prefill_wrapper
+
+    def _compute_attention_sorted_batch(
+        self,
+        sorted_q_list: List[torch.Tensor],
+        sorted_k_list: List[torch.Tensor],
+        sorted_v_list: List[torch.Tensor],
+        *,
+        L_q_list: List[int],
+        L_k_list: List[int],
+        first_q_row_list: List[int],
+        L_prev_list: List[int],
+        L_chunk_list: List[int],
+        L_total_list: List[int],
+        H_q: int,
+        D: int,
+        R: int,
+        C: int,
+        row_idx: int,
+        col_idx: int,
+        device: torch.device,
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        """Batched Q/K-split FlashInfer attention over B requests.
+
+        Reduces from B*s individual ``single_prefill_with_kv_cache`` calls to
+        s ``BatchPrefillWithRaggedKVCacheWrapper`` calls by grouping all B
+        requests into one ragged batch per split shard (one round per u/t).
+
+        Returns ``(output_sorted_list, lse_sorted_list)`` each of length B.
+        ``output_sorted_list[i]`` has shape ``(L_q_list[i], H_q, D)`` and
+        ``lse_sorted_list[i]`` has shape ``(L_q_list[i], H_q)``, both in
+        absolute-position sorted order.
+        """
+        B = len(sorted_q_list)
+        H_kv = self.num_kv_heads
+
+        # Pre-allocate per-request output tensors.
+        output_sorted_list: List[torch.Tensor] = []
+        lse_sorted_list: List[torch.Tensor] = []
+        for i in range(B):
+            L_q_i = L_q_list[i]
+            if L_q_i == 0 or L_k_list[i] == 0:
+                output_sorted_list.append(sorted_q_list[i].new_zeros(L_q_i, H_q, D))
+                lse_sorted_list.append(
+                    sorted_q_list[i].new_full((L_q_i, H_q), float("-inf"), dtype=torch.float32)
+                )
+            else:
+                output_sorted_list.append(sorted_q_list[i].new_empty(L_q_i, H_q, D))
+                lse_sorted_list.append(sorted_q_list[i].new_empty(L_q_i, H_q, dtype=torch.float32))
+
+        wrapper = self._get_ragged_prefill_wrapper(device)
+
+        if C % R == 0:
+            # Q-split: s = C/R rounds; full K/V replicated each round.
+            s = C // R
+            for t in range(s):
+                active_reqs: List[int] = []
+                q_parts: List[torch.Tensor] = []
+                k_parts: List[torch.Tensor] = []
+                v_parts: List[torch.Tensor] = []
+                qo_lens: List[int] = []
+                kv_lens: List[int] = []
+                dummy_flags: List[bool] = []
+                q_t_counts: List[int] = []
+
+                for i in range(B):
+                    L_q_i = L_q_list[i]
+                    L_k_i = L_k_list[i]
+                    if L_q_i == 0 or L_k_i == 0:
+                        continue
+                    Q_t = sorted_q_list[i][t::s]
+                    Q_t_count = Q_t.shape[0]
+                    if Q_t_count == 0:
+                        continue
+                    required_shift = (first_q_row_list[i] + t * R - col_idx) // C
+                    natural_shift = L_k_i - Q_t_count
+                    diff = natural_shift - required_shift
+                    assert diff in (0, 1), (
+                        f"unexpected dummy count {diff} at (row={row_idx}, col={col_idx}, t={t}) "
+                        f"for L_prev={L_prev_list[i]}, L_chunk={L_chunk_list[i]}, "
+                        f"L_total={L_total_list[i]}; natural={natural_shift}, required={required_shift}"
+                    )
+                    Q_in = (
+                        torch.cat([Q_t.contiguous(), Q_t.new_zeros(1, H_q, D)], dim=0)
+                        if diff == 1
+                        else Q_t.contiguous()
+                    )
+                    q_parts.append(Q_in)
+                    k_parts.append(sorted_k_list[i])
+                    v_parts.append(sorted_v_list[i])
+                    qo_lens.append(Q_in.shape[0])
+                    kv_lens.append(L_k_i)
+                    dummy_flags.append(diff == 1)
+                    q_t_counts.append(Q_t_count)
+                    active_reqs.append(i)
+
+                if not active_reqs:
+                    continue
+
+                q_cat = torch.cat(q_parts, dim=0)
+                k_cat = torch.cat(k_parts, dim=0)
+                v_cat = torch.cat(v_parts, dim=0)
+                qo_indptr = torch.tensor(
+                    [0] + list(accumulate(qo_lens)), dtype=torch.int32, device=device
+                )
+                kv_indptr = torch.tensor(
+                    [0] + list(accumulate(kv_lens)), dtype=torch.int32, device=device
+                )
+                wrapper.plan(
+                    qo_indptr,
+                    kv_indptr,
+                    H_q,
+                    H_kv,
+                    D,
+                    causal=True,
+                    q_data_type=q_cat.dtype,
+                    kv_data_type=k_cat.dtype,
+                )
+                out_t_all, lse_t_all = wrapper.run(q_cat, k_cat, v_cat, return_lse=True)
+
+                ptr = 0
+                for j, i in enumerate(active_reqs):
+                    qo_len = qo_lens[j]
+                    out_t = out_t_all[ptr : ptr + qo_len]
+                    lse_t = lse_t_all[ptr : ptr + qo_len]
+                    ptr += qo_len
+                    if dummy_flags[j]:
+                        out_t = out_t[:-1]
+                        lse_t = lse_t[:-1]
+                    output_sorted_list[i][t::s] = out_t
+                    lse_sorted_list[i][t::s] = lse_t
+
+        else:
+            # K-split: s = R/C rounds; Q replicated each round.
+            # After all rounds, LSE-merge the s partial results per request.
+            s = R // C
+            v_stacks: List[Optional[torch.Tensor]] = [
+                sorted_q_list[i].new_empty(L_q_list[i], s, H_q, D)
+                if L_q_list[i] > 0 and L_k_list[i] > 0
+                else None
+                for i in range(B)
+            ]
+            s_stacks: List[Optional[torch.Tensor]] = [
+                sorted_q_list[i].new_empty(L_q_list[i], s, H_q, dtype=torch.float32)
+                if L_q_list[i] > 0 and L_k_list[i] > 0
+                else None
+                for i in range(B)
+            ]
+
+            for u in range(s):
+                active_reqs = []
+                q_parts = []
+                k_parts = []
+                v_parts = []
+                qo_lens = []
+                kv_lens = []
+                dummy_flags = []
+
+                for i in range(B):
+                    L_q_i = L_q_list[i]
+                    L_k_i = L_k_list[i]
+                    if L_q_i == 0 or L_k_i == 0:
+                        continue
+                    K_u = sorted_k_list[i][u::s].contiguous()
+                    V_u = sorted_v_list[i][u::s].contiguous()
+                    K_u_count = K_u.shape[0]
+                    if K_u_count == 0:
+                        # Zero-fill this shard slot.
+                        v_stacks[i][:, u].zero_()  # type: ignore[index]
+                        s_stacks[i][:, u].fill_(float("-inf"))  # type: ignore[index]
+                        continue
+                    required_shift = (first_q_row_list[i] - col_idx - u * C) // R
+                    natural_shift = K_u_count - L_q_i
+                    diff = natural_shift - required_shift
+                    assert diff in (0, 1), (
+                        f"unexpected dummy count {diff} at (row={row_idx}, col={col_idx}, u={u}) "
+                        f"for L_prev={L_prev_list[i]}, L_chunk={L_chunk_list[i]}, "
+                        f"L_total={L_total_list[i]}; natural={natural_shift}, required={required_shift}"
+                    )
+                    Q_in = (
+                        torch.cat([sorted_q_list[i], sorted_q_list[i].new_zeros(1, H_q, D)], dim=0)
+                        if diff == 1
+                        else sorted_q_list[i]
+                    )
+                    q_parts.append(Q_in)
+                    k_parts.append(K_u)
+                    v_parts.append(V_u)
+                    qo_lens.append(Q_in.shape[0])
+                    kv_lens.append(K_u_count)
+                    dummy_flags.append(diff == 1)
+                    active_reqs.append(i)
+
+                if not active_reqs:
+                    continue
+
+                q_cat = torch.cat(q_parts, dim=0)
+                k_cat = torch.cat(k_parts, dim=0)
+                v_cat = torch.cat(v_parts, dim=0)
+                qo_indptr = torch.tensor(
+                    [0] + list(accumulate(qo_lens)), dtype=torch.int32, device=device
+                )
+                kv_indptr = torch.tensor(
+                    [0] + list(accumulate(kv_lens)), dtype=torch.int32, device=device
+                )
+                wrapper.plan(
+                    qo_indptr,
+                    kv_indptr,
+                    H_q,
+                    H_kv,
+                    D,
+                    causal=True,
+                    q_data_type=q_cat.dtype,
+                    kv_data_type=k_cat.dtype,
+                )
+                out_u_all, lse_u_all = wrapper.run(q_cat, k_cat, v_cat, return_lse=True)
+
+                ptr = 0
+                for j, i in enumerate(active_reqs):
+                    qo_len = qo_lens[j]
+                    out_u = out_u_all[ptr : ptr + qo_len]
+                    lse_u = lse_u_all[ptr : ptr + qo_len]
+                    ptr += qo_len
+                    if dummy_flags[j]:
+                        out_u = out_u[:-1]
+                        lse_u = lse_u[:-1]
+                    v_stacks[i][:, u] = out_u  # type: ignore[index]
+                    s_stacks[i][:, u] = lse_u  # type: ignore[index]
+
+            # LSE-merge the s K-shards per request.
+            for i in range(B):
+                if L_q_list[i] == 0 or L_k_list[i] == 0:
+                    continue
+                if s == 1:
+                    output_sorted_list[i] = v_stacks[i][:, 0]  # type: ignore[index]
+                    lse_sorted_list[i] = s_stacks[i][:, 0]  # type: ignore[index]
+                else:
+                    out_i, lse_i = flashinfer.merge_states(v_stacks[i], s_stacks[i])
+                    output_sorted_list[i] = out_i
+                    lse_sorted_list[i] = lse_i
+
+        return output_sorted_list, lse_sorted_list
 
     def _materialize_kv_from_pages(
         self,
