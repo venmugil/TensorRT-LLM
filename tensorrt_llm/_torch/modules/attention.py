@@ -567,19 +567,39 @@ class Attention(nn.Module):
         # For Helix CP, combine TP and CP for the output projection so each
         # rank's o_proj input is num_heads_tp_cp * head_dim.
         # For ATTN2D, CP is handled inside the attention backend so o_proj
-        # uses TP only (same as the no-CP case).
-        o_proj_tp_size = tp_size * (cp_size
-                                    if self.mapping.has_cp_helix() else 1)
-        o_proj_world_size = dp_size * o_proj_tp_size * pp_size
-        mapping_o = Mapping(
-            world_size=o_proj_world_size,
-            tp_size=o_proj_tp_size,
-            pp_size=pp_size * dp_size,
-            cp_size=1,
-            rank=self.mapping.rank % o_proj_world_size,
-            gpus_per_node=self.mapping.gpus_per_node,
-            enable_attention_dp=self.mapping.enable_attention_dp,
-        )
+        # uses TP only (same as the no-CP case).  However, with ATTN2D and
+        # tp_size > 1 the TP peers are stride-cp_size apart in the global rank
+        # ordering (tp_rank = rank // cp_size), so we must include cp_size in
+        # the mapping so _init_parallel_groups builds the correct groups.
+        if self.mapping.has_cp_attn2d() and tp_size > 1:
+            # Pass the full ATTN2D mapping so TP groups are built with stride
+            # cp_size.  MoE fields are irrelevant for o_proj; the validation in
+            # MappingBase.__init__ still passes because moe defaults match.
+            o_proj_tp_size = tp_size
+            o_proj_world_size = dp_size * tp_size * cp_size * pp_size
+            mapping_o = Mapping(
+                world_size=o_proj_world_size,
+                tp_size=o_proj_tp_size,
+                pp_size=pp_size * dp_size,
+                cp_size=cp_size,
+                cp_config=self.mapping.cp_config,
+                rank=self.mapping.rank % o_proj_world_size,
+                gpus_per_node=self.mapping.gpus_per_node,
+                enable_attention_dp=self.mapping.enable_attention_dp,
+            )
+        else:
+            o_proj_tp_size = tp_size * (cp_size
+                                        if self.mapping.has_cp_helix() else 1)
+            o_proj_world_size = dp_size * o_proj_tp_size * pp_size
+            mapping_o = Mapping(
+                world_size=o_proj_world_size,
+                tp_size=o_proj_tp_size,
+                pp_size=pp_size * dp_size,
+                cp_size=1,
+                rank=self.mapping.rank % o_proj_world_size,
+                gpus_per_node=self.mapping.gpus_per_node,
+                enable_attention_dp=self.mapping.enable_attention_dp,
+            )
         self.mapping_o = mapping_o
 
         self.o_proj = Linear(

@@ -228,7 +228,16 @@ class Attn2DFlashInferAttentionMetadata(AttentionMetadata):
         block_ids_per_seq = self.kv_cache_manager.get_batch_cache_indices(self.request_ids)
         indices_list: List[int] = []
         for i, block_ids in enumerate(block_ids_per_seq):
-            indices_list.extend(block_ids[: self.num_blocks_per_request[i]])
+            want = self.num_blocks_per_request[i]
+            got = len(block_ids)
+            if got < want:
+                raise RuntimeError(
+                    f"KV cache OOM: request index {i} (id={self.request_ids[i]}) "
+                    f"needs {want} blocks but only {got} were allocated. "
+                    f"Reduce --num-requests, lower input length, or increase "
+                    f"free_gpu_memory_fraction."
+                )
+            indices_list.extend(block_ids[:want])
         if indices_list:
             indices_tensor = torch.tensor(indices_list, dtype=torch.int32)
             self.paged_kv_indices[: indices_tensor.size(0)].copy_(indices_tensor, non_blocking=True)
