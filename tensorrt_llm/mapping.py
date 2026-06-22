@@ -112,8 +112,14 @@ class MappingBase:
             self._dwdp_moe_ep_rank = 0
 
             if moe_tp_size == -1 and moe_ep_size == -1:
-                moe_tp_size = moe_world_size // moe_cluster_size
-                moe_ep_size = 1
+                if cp_type == CpType.ATTN2D:
+                    # ATTN2D shards tokens across CP ranks so moe_tp > 1 is
+                    # unsupported (see check below).  Default to pure EP.
+                    moe_ep_size = moe_world_size // moe_cluster_size
+                    moe_tp_size = 1
+                else:
+                    moe_tp_size = moe_world_size // moe_cluster_size
+                    moe_ep_size = 1
 
             elif moe_tp_size == -1:
                 moe_tp_size = moe_world_size // (moe_ep_size * moe_cluster_size)
@@ -185,6 +191,13 @@ class MappingBase:
                                                                 CpType.ATTN2D):
             raise NotImplementedError(
                 f"CP {cp_type} doesn't support MoE tp/ep yet")
+
+        if moe_tp_size > 1 and cp_size > 1 and cp_type == CpType.ATTN2D:
+            raise NotImplementedError(
+                "ATTN2D CP does not support moe_tp_size > 1: each moe_tp rank "
+                "receives a disjoint token shard after EP dispatch and there is "
+                "no all-gather to assemble the full token set before the expert "
+                "GEMM. Use moe_ep only (moe_tp_size=1) with ATTN2D.")
 
         if moe_cluster_size > 1:
             assert moe_ep_size == 1
@@ -268,18 +281,33 @@ class MappingBase:
         self._rank = rank
 
     @property
+    def moe_rank(self) -> int:
+        """Rank within the MoE world.
+
+        For ULYSSES and HELIX, moe_rank == tp_rank.  HELIX repurposes its CP
+        ranks into TP via repurpose_helix_cp_to_tp(), so MoE layers always
+        receive a Mapping with cp_size=1 where tp_rank already covers the full
+        moe_world_size.  For ATTN2D the same Mapping is used for both attention
+        and MoE, and moe_world_size == tp_size * cp_size, so both dimensions
+        must contribute.
+        """
+        if self.cp_config.get("cp_type", CpType.ULYSSES) == CpType.ATTN2D:
+            return self.tp_rank * self.cp_size + self.cp_rank
+        return self.tp_rank
+
+    @property
     def moe_tp_rank(self):
-        return self.tp_rank // (self.moe_ep_size * self.moe_cluster_size)
+        return self.moe_rank // (self.moe_ep_size * self.moe_cluster_size)
 
     @property
     def moe_cluster_rank(self):
-        return self.tp_rank % self.moe_cluster_size
+        return self.moe_rank % self.moe_cluster_size
 
     @property
     def moe_ep_rank(self):
         if self._dwdp_size > 1:
             return self._dwdp_moe_ep_rank
-        return self.tp_rank % self.moe_ep_size
+        return self.moe_rank % self.moe_ep_size
 
     @property
     def dwdp_size(self) -> int:
