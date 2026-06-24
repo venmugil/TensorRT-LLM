@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -92,7 +92,11 @@ class MappingBase:
                 cp_config["cp_type"] = CpType(cp_type_str)
             cp_type = cp_config.get("cp_type", CpType.ULYSSES)
 
-        moe_world_size = tp_size if cp_type == CpType.ULYSSES else tp_size * cp_size
+        # For ULYSSES and ATTN2D, MoE operates within the TP dimension only.
+        # CP ranks act as independent data-parallel replicas for MoE.
+        # For HELIX and other CP types, CP folds into TP via repurpose_helix_cp_to_tp().
+        moe_world_size = tp_size if cp_type in (
+            CpType.ULYSSES, CpType.ATTN2D) else tp_size * cp_size
 
         # DWDP override: when dwdp_size > 1, decouple the fused-MoE EP layout
         # from DWDP. Setting ``moe_ep_size = 1`` makes the fused MoE backend
@@ -113,8 +117,10 @@ class MappingBase:
 
             if moe_tp_size == -1 and moe_ep_size == -1:
                 if cp_type == CpType.ATTN2D:
-                    # ATTN2D shards tokens across CP ranks so moe_tp > 1 is
-                    # unsupported (see check below).  Default to pure EP.
+                    # ATTN2D: moe_world_size == tp_size.  Default to pure EP so
+                    # each TP rank holds a disjoint expert shard; CP ranks are
+                    # independent MoE DP replicas.  Users may also set
+                    # moe_tp_size > 1 for 3D (TP+EP+DP=CP) parallelism.
                     moe_ep_size = moe_world_size // moe_cluster_size
                     moe_tp_size = 1
                 else:
@@ -191,13 +197,6 @@ class MappingBase:
                                                                 CpType.ATTN2D):
             raise NotImplementedError(
                 f"CP {cp_type} doesn't support MoE tp/ep yet")
-
-        if moe_tp_size > 1 and cp_size > 1 and cp_type == CpType.ATTN2D:
-            raise NotImplementedError(
-                "ATTN2D CP does not support moe_tp_size > 1: each moe_tp rank "
-                "receives a disjoint token shard after EP dispatch and there is "
-                "no all-gather to assemble the full token set before the expert "
-                "GEMM. Use moe_ep only (moe_tp_size=1) with ATTN2D.")
 
         if moe_cluster_size > 1:
             assert moe_ep_size == 1
@@ -281,33 +280,18 @@ class MappingBase:
         self._rank = rank
 
     @property
-    def moe_rank(self) -> int:
-        """Rank within the MoE world.
-
-        For ULYSSES and HELIX, moe_rank == tp_rank.  HELIX repurposes its CP
-        ranks into TP via repurpose_helix_cp_to_tp(), so MoE layers always
-        receive a Mapping with cp_size=1 where tp_rank already covers the full
-        moe_world_size.  For ATTN2D the same Mapping is used for both attention
-        and MoE, and moe_world_size == tp_size * cp_size, so both dimensions
-        must contribute.
-        """
-        if self.cp_config.get("cp_type", CpType.ULYSSES) == CpType.ATTN2D:
-            return self.tp_rank * self.cp_size + self.cp_rank
-        return self.tp_rank
-
-    @property
     def moe_tp_rank(self):
-        return self.moe_rank // (self.moe_ep_size * self.moe_cluster_size)
+        return self.tp_rank // (self.moe_ep_size * self.moe_cluster_size)
 
     @property
     def moe_cluster_rank(self):
-        return self.moe_rank % self.moe_cluster_size
+        return self.tp_rank % self.moe_cluster_size
 
     @property
     def moe_ep_rank(self):
         if self._dwdp_size > 1:
             return self._dwdp_moe_ep_rank
-        return self.moe_rank % self.moe_ep_size
+        return self.tp_rank % self.moe_ep_size
 
     @property
     def dwdp_size(self) -> int:
@@ -776,21 +760,30 @@ class MpiTopology(Mapping):
 
     @property
     def moe_tp_group(self) -> List[int]:
-        return self.moe_tp_groups[self.pp_rank * self.moe_cluster_size *
+        # For ATTN2D, each cp_rank has its own MoE group slice, so the (pp, cp)
+        # pair is the effective index. pp_cp folds cp into pp for that case;
+        # for other CP types it collapses to pp_rank.
+        pp_cp = self.pp_rank * self.cp_size + self.cp_rank if self.has_cp_attn2d(
+        ) else self.pp_rank
+        return self.moe_tp_groups[pp_cp * self.moe_cluster_size *
                                   self.moe_ep_size +
                                   self.moe_cluster_rank * self.moe_ep_size +
                                   self.moe_ep_rank]
 
     @property
     def moe_ep_group(self) -> List[int]:
-        return self.moe_ep_groups[self.pp_rank * self.moe_tp_size *
+        pp_cp = self.pp_rank * self.cp_size + self.cp_rank if self.has_cp_attn2d(
+        ) else self.pp_rank
+        return self.moe_ep_groups[pp_cp * self.moe_tp_size *
                                   self.moe_cluster_size +
                                   self.moe_tp_rank * self.moe_cluster_size +
                                   self.moe_cluster_rank]
 
     @property
     def moe_cluster_group(self) -> List[int]:
-        return self.moe_cluster_groups[self.pp_rank * self.moe_tp_size +
+        pp_cp = self.pp_rank * self.cp_size + self.cp_rank if self.has_cp_attn2d(
+        ) else self.pp_rank
+        return self.moe_cluster_groups[pp_cp * self.moe_tp_size +
                                        self.moe_tp_rank]
 
     def _init_parallel_groups(self):
@@ -815,35 +808,43 @@ class MpiTopology(Mapping):
                               self.cp_size)
                 self.tp_groups.append(list(ranks))
 
-        # init moe tp group
-        for i in range(self.pp_size):
-            for j in range(self.moe_cluster_size * self.moe_ep_size):
-                ranks = range(i * self.moe_tp_cluster_ep_size + j,
-                              (i + 1) * self.moe_tp_cluster_ep_size,
-                              self.moe_cluster_size * self.moe_ep_size)
-                self.moe_tp_groups.append(list(ranks))
+        # For ATTN2D, MoE groups are scoped per cp_rank (each cp_rank holds a
+        # distinct token shard and forms an independent MoE DP replica).
+        # C=cp_size introduces the cp_rank dimension; C=1 collapses the loops to
+        # the standard non-ATTN2D layout so a single code path handles both.
+        T = self.moe_tp_cluster_ep_size
+        C = self.cp_size if self.has_cp_attn2d() else 1
+        K = self.moe_cluster_size
+        E = self.moe_ep_size
+        M = self.moe_tp_size
 
-        # init moe cluster group
+        # init moe tp groups
+        # Ordering: (pp, cp_rank, moe_cluster_rank, moe_ep_rank)
+        # j = k*E+e is the flat cluster+ep index; base steps by C across cp_ranks.
         for i in range(self.pp_size):
-            for j in range(self.moe_tp_size):
-                ranks = range(
-                    i * self.moe_tp_cluster_ep_size +
-                    j * self.moe_cluster_size * self.moe_ep_size,
-                    i * self.moe_tp_cluster_ep_size +
-                    (j + 1) * self.moe_cluster_size * self.moe_ep_size)
-                self.moe_cluster_groups.append(list(ranks))
+            for c in range(C):
+                for j in range(K * E):
+                    base = i * T * C + j * C + c
+                    self.moe_tp_groups.append(
+                        [base + t * K * E * C for t in range(M)])
 
-        # init moe ep group
+        # init moe cluster groups
+        # Ordering: (pp, cp_rank, moe_tp_rank)
         for i in range(self.pp_size):
-            for j in range(self.moe_tp_size):
-                for k in range(self.moe_cluster_size):
-                    ranks = range(
-                        i * self.moe_tp_cluster_ep_size +
-                        j * self.moe_cluster_size * self.moe_ep_size +
-                        k * self.moe_ep_size, i * self.moe_tp_cluster_ep_size +
-                        j * self.moe_cluster_size * self.moe_ep_size +
-                        (k + 1) * self.moe_ep_size)
-                    self.moe_ep_groups.append(list(ranks))
+            for c in range(C):
+                for t in range(M):
+                    base = i * T * C + t * K * E * C + c
+                    self.moe_cluster_groups.append(
+                        [base + j * C for j in range(K * E)])
+
+        # init moe ep groups
+        # Ordering: (pp, cp_rank, moe_tp_rank, moe_cluster_rank)
+        # j = t*K+k is the flat tp+cluster index.
+        for i in range(self.pp_size):
+            for c in range(C):
+                for j in range(M * K):
+                    base = i * T * C + j * E * C + c
+                    self.moe_ep_groups.append([base + e * C for e in range(E)])
 
 
 class DeviceMeshTopology(DeviceMeshTopologyImpl, Mapping):
