@@ -104,13 +104,11 @@ class CommunicationFactory:
         use_low_precision_combine = model_config.use_low_precision_moe_combine
 
         # If attention does not use data parallelism (either uses TP or single card), no MoE communication is needed.
-        # ATTN2D with moe_ep_size > 1 is excluded from the early return: each rank holds a distinct token shard,
-        # so EP dispatch/combine is still required even though enable_attention_dp is False and dp_size == 1.
-        # ATTN2D with moe_ep_size == 1 (cluster mode: all experts replicated on every rank) does not need any
-        # dispatch/combine — each rank processes its local token shard against its local full expert set.
-        if ((not mapping.enable_attention_dp) or mapping.dp_size == 1) and not (
-            mapping.has_cp_attn2d() and mapping.moe_ep_size > 1
-        ):
+        # ATTN2D is excluded from the early return: CP is repurposed as MoE EP, so each rank holds a distinct
+        # expert shard and EP dispatch/combine is always required (moe_ep_size == cp_size > 1 is enforced).
+        if (
+            (not mapping.enable_attention_dp) or mapping.dp_size == 1
+        ) and not mapping.has_cp_attn2d():
             return None
 
         # If no attention DP, or if MoE TP is enabled, use AllGather + ReduceScatter

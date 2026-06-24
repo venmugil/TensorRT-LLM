@@ -92,11 +92,17 @@ class MappingBase:
                 cp_config["cp_type"] = CpType(cp_type_str)
             cp_type = cp_config.get("cp_type", CpType.ULYSSES)
 
-        # For ULYSSES and ATTN2D, MoE operates within the TP dimension only.
-        # CP ranks act as independent data-parallel replicas for MoE.
+        # For ULYSSES, CP ranks are independent MoE DP replicas so MoE operates
+        # within the TP dimension only.  For ATTN2D without ADP, TP is MoE TP
+        # and CP is MoE EP (experts sharded across CP ranks, no replication).
+        # For ATTN2D with ADP, TP ranks are DP replicas so MoE world is just CP.
         # For HELIX and other CP types, CP folds into TP via repurpose_helix_cp_to_tp().
-        moe_world_size = tp_size if cp_type in (
-            CpType.ULYSSES, CpType.ATTN2D) else tp_size * cp_size
+        if cp_type == CpType.ATTN2D and enable_attention_dp:
+            moe_world_size = cp_size
+        elif cp_type == CpType.ULYSSES:
+            moe_world_size = tp_size
+        else:
+            moe_world_size = tp_size * cp_size
 
         # DWDP override: when dwdp_size > 1, decouple the fused-MoE EP layout
         # from DWDP. Setting ``moe_ep_size = 1`` makes the fused MoE backend
@@ -117,12 +123,11 @@ class MappingBase:
 
             if moe_tp_size == -1 and moe_ep_size == -1:
                 if cp_type == CpType.ATTN2D:
-                    # ATTN2D: moe_world_size == tp_size.  Default to pure EP so
-                    # each TP rank holds a disjoint expert shard; CP ranks are
-                    # independent MoE DP replicas.  Users may also set
-                    # moe_tp_size > 1 for 3D (TP+EP+DP=CP) parallelism.
-                    moe_ep_size = moe_world_size // moe_cluster_size
-                    moe_tp_size = 1
+                    # CP is always MoE EP (experts sharded across CP ranks).
+                    # With ADP, TP ranks are DP replicas so moe_tp=1.
+                    # Without ADP, TP participates in MoE weight sharding (moe_tp=tp).
+                    moe_ep_size = cp_size
+                    moe_tp_size = 1 if enable_attention_dp else tp_size
                 else:
                     moe_tp_size = moe_world_size // moe_cluster_size
                     moe_ep_size = 1
@@ -132,6 +137,21 @@ class MappingBase:
 
             elif moe_ep_size == -1:
                 moe_ep_size = moe_world_size // (moe_tp_size * moe_cluster_size)
+
+            if cp_type == CpType.ATTN2D and cp_size > 1:
+                if moe_cluster_size > 1:
+                    raise ValueError(
+                        "ATTN2D does not support moe_cluster_size > 1: "
+                        "cluster mode requires moe_ep_size=1, but ATTN2D "
+                        "repurposes CP as MoE EP (moe_ep_size=cp_size).")
+                expected_moe_tp = 1 if enable_attention_dp else tp_size
+                if moe_ep_size != cp_size or moe_tp_size != expected_moe_tp:
+                    raise ValueError(
+                        f"ATTN2D repurposes CP as MoE EP: moe_ep_size must "
+                        f"equal cp_size={cp_size} and moe_tp_size must equal "
+                        f"{'1 (ADP: TP ranks are DP replicas)' if enable_attention_dp else f'tp_size={tp_size}'}, "
+                        f"got moe_ep_size={moe_ep_size}, moe_tp_size={moe_tp_size}"
+                    )
 
         if attn_tp_size == -1 and attn_cp_size == -1:
             if cp_type == CpType.ULYSSES:
@@ -281,16 +301,25 @@ class MappingBase:
 
     @property
     def moe_tp_rank(self):
+        if self.has_cp_attn2d():
+            # ADP: moe_tp_size=1 so rank is always 0.
+            # Non-ADP: moe_tp_size=tp_size so rank equals tp_rank.
+            return 0 if self.enable_attention_dp else self.tp_rank
         return self.tp_rank // (self.moe_ep_size * self.moe_cluster_size)
 
     @property
     def moe_cluster_rank(self):
+        if self.has_cp_attn2d():
+            assert self.moe_cluster_size == 1
+            return 0
         return self.tp_rank % self.moe_cluster_size
 
     @property
     def moe_ep_rank(self):
         if self._dwdp_size > 1:
             return self._dwdp_moe_ep_rank
+        if self.has_cp_attn2d():
+            return self.cp_rank
         return self.tp_rank % self.moe_ep_size
 
     @property
@@ -307,6 +336,8 @@ class MappingBase:
 
     @property
     def moe_cluster_group(self):
+        if self.has_cp_attn2d():
+            return [self.rank]
         return self.moe_cluster_groups[self.pp_rank * self.moe_tp_size +
                                        self.moe_tp_rank]
 
@@ -760,30 +791,30 @@ class MpiTopology(Mapping):
 
     @property
     def moe_tp_group(self) -> List[int]:
-        # For ATTN2D, each cp_rank has its own MoE group slice, so the (pp, cp)
-        # pair is the effective index. pp_cp folds cp into pp for that case;
-        # for other CP types it collapses to pp_rank.
-        pp_cp = self.pp_rank * self.cp_size + self.cp_rank if self.has_cp_attn2d(
-        ) else self.pp_rank
-        return self.moe_tp_groups[pp_cp * self.moe_cluster_size *
+        if self.has_cp_attn2d():
+            # ADP: TP ranks are DP replicas (moe_tp_size=1), singleton group.
+            # Non-ADP: TP is MoE TP, reuse existing tp_group.
+            return [self.rank] if self.enable_attention_dp else self.tp_group
+        return self.moe_tp_groups[self.pp_rank * self.moe_cluster_size *
                                   self.moe_ep_size +
                                   self.moe_cluster_rank * self.moe_ep_size +
                                   self.moe_ep_rank]
 
     @property
     def moe_ep_group(self) -> List[int]:
-        pp_cp = self.pp_rank * self.cp_size + self.cp_rank if self.has_cp_attn2d(
-        ) else self.pp_rank
-        return self.moe_ep_groups[pp_cp * self.moe_tp_size *
+        # ATTN2D: CP is repurposed as MoE EP — reuse the existing cp_group.
+        if self.has_cp_attn2d():
+            return self.cp_group
+        return self.moe_ep_groups[self.pp_rank * self.moe_tp_size *
                                   self.moe_cluster_size +
                                   self.moe_tp_rank * self.moe_cluster_size +
                                   self.moe_cluster_rank]
 
     @property
     def moe_cluster_group(self) -> List[int]:
-        pp_cp = self.pp_rank * self.cp_size + self.cp_rank if self.has_cp_attn2d(
-        ) else self.pp_rank
-        return self.moe_cluster_groups[pp_cp * self.moe_tp_size +
+        if self.has_cp_attn2d():
+            return [self.rank]
+        return self.moe_cluster_groups[self.pp_rank * self.moe_tp_size +
                                        self.moe_tp_rank]
 
     def _init_parallel_groups(self):
@@ -808,43 +839,40 @@ class MpiTopology(Mapping):
                               self.cp_size)
                 self.tp_groups.append(list(ranks))
 
-        # For ATTN2D, MoE groups are scoped per cp_rank (each cp_rank holds a
-        # distinct token shard and forms an independent MoE DP replica).
-        # C=cp_size introduces the cp_rank dimension; C=1 collapses the loops to
-        # the standard non-ATTN2D layout so a single code path handles both.
-        T = self.moe_tp_cluster_ep_size
-        C = self.cp_size if self.has_cp_attn2d() else 1
-        K = self.moe_cluster_size
-        E = self.moe_ep_size
-        M = self.moe_tp_size
+        # For ATTN2D, moe_tp_group == tp_group and moe_ep_group == cp_group;
+        # accessors delegate directly so no separate list generation is needed.
+        if self.has_cp_attn2d():
+            return
 
-        # init moe tp groups
-        # Ordering: (pp, cp_rank, moe_cluster_rank, moe_ep_rank)
-        # j = k*E+e is the flat cluster+ep index; base steps by C across cp_ranks.
+        # init moe tp group
         for i in range(self.pp_size):
-            for c in range(C):
-                for j in range(K * E):
-                    base = i * T * C + j * C + c
-                    self.moe_tp_groups.append(
-                        [base + t * K * E * C for t in range(M)])
+            for j in range(self.moe_cluster_size * self.moe_ep_size):
+                ranks = range(i * self.moe_tp_cluster_ep_size + j,
+                              (i + 1) * self.moe_tp_cluster_ep_size,
+                              self.moe_cluster_size * self.moe_ep_size)
+                self.moe_tp_groups.append(list(ranks))
 
-        # init moe cluster groups
-        # Ordering: (pp, cp_rank, moe_tp_rank)
+        # init moe cluster group
         for i in range(self.pp_size):
-            for c in range(C):
-                for t in range(M):
-                    base = i * T * C + t * K * E * C + c
-                    self.moe_cluster_groups.append(
-                        [base + j * C for j in range(K * E)])
+            for j in range(self.moe_tp_size):
+                ranks = range(
+                    i * self.moe_tp_cluster_ep_size +
+                    j * self.moe_cluster_size * self.moe_ep_size,
+                    i * self.moe_tp_cluster_ep_size +
+                    (j + 1) * self.moe_cluster_size * self.moe_ep_size)
+                self.moe_cluster_groups.append(list(ranks))
 
-        # init moe ep groups
-        # Ordering: (pp, cp_rank, moe_tp_rank, moe_cluster_rank)
-        # j = t*K+k is the flat tp+cluster index.
+        # init moe ep group
         for i in range(self.pp_size):
-            for c in range(C):
-                for j in range(M * K):
-                    base = i * T * C + j * E * C + c
-                    self.moe_ep_groups.append([base + e * C for e in range(E)])
+            for j in range(self.moe_tp_size):
+                for k in range(self.moe_cluster_size):
+                    ranks = range(
+                        i * self.moe_tp_cluster_ep_size +
+                        j * self.moe_cluster_size * self.moe_ep_size +
+                        k * self.moe_ep_size, i * self.moe_tp_cluster_ep_size +
+                        j * self.moe_cluster_size * self.moe_ep_size +
+                        (k + 1) * self.moe_ep_size)
+                    self.moe_ep_groups.append(list(ranks))
 
 
 class DeviceMeshTopology(DeviceMeshTopologyImpl, Mapping):
