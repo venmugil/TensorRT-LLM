@@ -1131,8 +1131,23 @@ class LlamaModel(DecoderModel):
         return hidden_states
 
 
+def _attn2d_dense_ffn_defaults(llm_args) -> dict:
+    from tensorrt_llm.llmapi.llm_args import CpType
+    if (llm_args.cp_config is not None
+            and llm_args.cp_config.cp_type == CpType.ATTN2D):
+        return {"cp_config": {"dense_ffn": True}}
+    return {}
+
+
 @register_auto_model("LlamaForCausalLM")
 class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
+
+    @classmethod
+    def get_model_defaults(cls, llm_args) -> dict:
+        """Mark the mapping dense_ffn under ATTN2D so the MoE-specific
+        sequence-parallel o_proj reduce-scatter is suppressed; the FFN
+        runs as standard tp-way TP GatedMLP on each rank's CP token shard."""
+        return _attn2d_dense_ffn_defaults(llm_args)
 
     def __init__(
         self,
@@ -1608,6 +1623,13 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
 
 @register_auto_model("MistralForCausalLM")
 class MistralForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
+
+    @classmethod
+    def get_model_defaults(cls, llm_args) -> dict:
+        """Mark the mapping dense_ffn under ATTN2D so the MoE-specific
+        sequence-parallel o_proj reduce-scatter is suppressed; the FFN
+        runs as standard tp-way TP GatedMLP on each rank's CP token shard."""
+        return _attn2d_dense_ffn_defaults(llm_args)
 
     def __init__(
         self,

@@ -740,3 +740,50 @@ class TestLlama(unittest.TestCase):
         assert token_id_ref == token_id_gen, "Greedy sampling token id not match"
 
         kv_cache_manager.shutdown()
+
+
+class TestLlamaModelDefaults(unittest.TestCase):
+    """Tests for get_model_defaults ATTN2D dense-FFN wiring on Llama/Mistral."""
+
+    def _make_attn2d_args(self):
+        from types import SimpleNamespace
+
+        from tensorrt_llm.mapping import CpType
+        cp_config = SimpleNamespace(cp_type=CpType.ATTN2D)
+        return SimpleNamespace(cp_config=cp_config)
+
+    def _make_non_attn2d_args(self):
+        from types import SimpleNamespace
+
+        from tensorrt_llm.mapping import CpType
+        cp_config = SimpleNamespace(cp_type=CpType.HELIX)
+        return SimpleNamespace(cp_config=cp_config)
+
+    def _make_no_cp_args(self):
+        from types import SimpleNamespace
+        return SimpleNamespace(cp_config=None)
+
+    def test_llama_attn2d_sets_dense_ffn(self):
+        defaults = LlamaForCausalLM.get_model_defaults(self._make_attn2d_args())
+        self.assertEqual(defaults, {"cp_config": {"dense_ffn": True}})
+
+    def test_llama_non_attn2d_returns_empty(self):
+        self.assertEqual(
+            LlamaForCausalLM.get_model_defaults(self._make_non_attn2d_args()),
+            {})
+
+    def test_llama_no_cp_returns_empty(self):
+        self.assertEqual(
+            LlamaForCausalLM.get_model_defaults(self._make_no_cp_args()), {})
+
+    def test_mistral_attn2d_sets_dense_ffn(self):
+        from tensorrt_llm._torch.models.modeling_llama import MistralForCausalLM
+        defaults = MistralForCausalLM.get_model_defaults(
+            self._make_attn2d_args())
+        self.assertEqual(defaults, {"cp_config": {"dense_ffn": True}})
+
+    def test_mistral_non_attn2d_returns_empty(self):
+        from tensorrt_llm._torch.models.modeling_llama import MistralForCausalLM
+        self.assertEqual(
+            MistralForCausalLM.get_model_defaults(self._make_non_attn2d_args()),
+            {})
