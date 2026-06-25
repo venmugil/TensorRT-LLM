@@ -2540,6 +2540,14 @@ class PyTorchModelEngine(ModelEngine):
                 # with its tp_rank.
                 num_tokens = math.ceil(num_tokens / self.mapping.cp_size)
                 return list(self.dist.tp_cp_allgather(num_tokens))
+            if self.mapping.has_cp_attn2d():
+                # ATTN2D+ADP: tokens are unique across all tp×cp ranks
+                # (tp_rank selects requests, cp_rank selects positions).
+                # EP spans the full PP stage (moe_ep_size = tp*cp), so the
+                # token-count list must have tp×cp entries indexed by
+                # moe_ep_rank = tp_rank*cp_size + cp_rank.
+                # tp_cp_allgather produces exactly that ordering.
+                return list(self.dist.tp_cp_allgather(num_tokens))
             return list(self.dist.tp_allgather(num_tokens))
         return None
 

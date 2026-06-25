@@ -876,3 +876,279 @@ def test_attn2d_flashinfer_chunked_prefill(R, C, chunk_offset, L_extra):
         results = ex.map(_entrypoint_chunked, *zip(*[args] * P))
         for r in results:
             assert r is True
+
+
+# ---------------------------------------------------------------------------
+# MoE mapping verification tests
+#
+# These tests do NOT exercise actual MoE computation or NVLink communication.
+# Their purpose is to verify that the Mapping object (as seen by live MPI
+# workers) derives the correct MoE EP / TP properties for ATTN2D at tp=1.
+#
+# Why multi-GPU rather than CPU-only unit tests?
+#   Each MPIPoolExecutor worker is a real separate MPI process.  The Mapping
+#   constructed there uses MpiTopology (mpi_disabled()=False), and each rank
+#   computes its own cp_rank / cp_group from the actual MPI rank ordinal.
+#   The assertions confirm the derivation is consistent in a live distributed
+#   setting, not only when evaluated from a single Python process.
+#
+# Coverage:
+#   tp=1, cp=P (no ADP): ✅ correct comm path (moe_tp=1, moe_ep=P)
+#   tp=1, cp=P (ADP):    ✅ correct (moe_tp=1, moe_ep=P, same as no-ADP for tp=1)
+#   tp=2, cp=2 (no ADP): ❌ broken comm — documented here via xfail
+#   tp=2, cp=2 (ADP):    ✅ fixed — moe_ep=tp*cp=4, mapping agrees with backends
+# ---------------------------------------------------------------------------
+
+
+def _run_attn2d_moe_mapping_check(world_size, rank, R, C, enable_adp) -> bool:
+    """Per-rank worker: build ATTN2D mapping (tp=1) and assert MoE EP properties.
+
+    This function runs on each MPI worker.  It verifies:
+      - moe_ep_size == cp_size == P  (CP is repurposed as EP)
+      - moe_tp_size == 1             (tp=1; ADP adds nothing new here)
+      - moe_ep_rank == cp_rank       (EP rank derived from CP rank)
+      - moe_tp_rank == 0             (singleton TP)
+      - moe_ep_group == full CP group (all P ranks)
+      - moe_tp_group == [rank]       (singleton)
+      - moe_cluster_size == 1, moe_cluster_rank == 0
+      - moe_ep_groups == []          (_init_parallel_groups early-returns)
+    """
+    P = R * C  # cp_size = world_size (tp=1, pp=1)
+    assert world_size == P
+
+    mapping = Mapping(
+        world_size=P,
+        rank=rank,
+        cp_size=P,
+        cp_config={
+            "cp_type": CpType.ATTN2D,
+            "row_size": R,
+            "col_size": C,
+        },
+        enable_attention_dp=enable_adp,
+    )
+
+    # --- Size derivation ---
+    assert mapping.moe_ep_size == P, (
+        f"rank {rank}: moe_ep_size {mapping.moe_ep_size} != cp_size {P}"
+    )
+    assert mapping.moe_tp_size == 1, f"rank {rank}: moe_tp_size {mapping.moe_tp_size} != 1"
+    assert mapping.moe_cluster_size == 1, (
+        f"rank {rank}: moe_cluster_size {mapping.moe_cluster_size} != 1"
+    )
+
+    # --- Rank accessors ---
+    # For tp=1, pp=1: cp_rank == rank (cyclic, all ranks in one CP group).
+    assert mapping.cp_rank == rank, f"rank {rank}: cp_rank {mapping.cp_rank} != rank"
+    assert mapping.moe_ep_rank == rank, (
+        f"rank {rank}: moe_ep_rank {mapping.moe_ep_rank} != cp_rank {rank}"
+    )
+    assert mapping.moe_tp_rank == 0, f"rank {rank}: moe_tp_rank {mapping.moe_tp_rank} != 0"
+    assert mapping.moe_cluster_rank == 0, (
+        f"rank {rank}: moe_cluster_rank {mapping.moe_cluster_rank} != 0"
+    )
+
+    # --- Group membership ---
+    expected_ep_group = list(range(P))
+    assert mapping.moe_ep_group == expected_ep_group, (
+        f"rank {rank}: moe_ep_group {mapping.moe_ep_group} != {expected_ep_group}"
+    )
+    assert mapping.cp_group == expected_ep_group, (
+        f"rank {rank}: cp_group {mapping.cp_group} != {expected_ep_group}"
+    )
+    assert mapping.moe_tp_group == [rank], (
+        f"rank {rank}: moe_tp_group {mapping.moe_tp_group} != [{rank}]"
+    )
+
+    # --- No stale moe group lists ---
+    assert mapping.moe_ep_groups == [], f"rank {rank}: moe_ep_groups should be empty for ATTN2D"
+    assert mapping.moe_tp_groups == [], f"rank {rank}: moe_tp_groups should be empty for ATTN2D"
+
+    # --- has_moe_ep / has_moe_tp helpers ---
+    assert mapping.has_moe_ep(), f"rank {rank}: has_moe_ep() should be True (moe_ep_size={P})"
+    assert not mapping.has_moe_tp(), f"rank {rank}: has_moe_tp() should be False (moe_tp_size=1)"
+
+    return True
+
+
+def _entrypoint_moe_mapping(world_size, R, C, enable_adp):
+    """MPIPoolExecutor entry for the MoE mapping check."""
+    rank = tensorrt_llm.mpi_rank()
+    try:
+        return _run_attn2d_moe_mapping_check(world_size, rank, R, C, enable_adp)
+    except Exception:
+        traceback.print_exc()
+        raise
+
+
+@pytest.mark.parametrize("R,C", [(2, 2), (4, 1), (1, 4)])
+@pytest.mark.parametrize("enable_adp", [False, True], ids=["no_adp", "adp"])
+@pytest.mark.threadleak(enabled=False)
+def test_attn2d_moe_mapping_properties_tp1(R, C, enable_adp):
+    """ATTN2D mapping at tp=1 derives correct MoE EP properties on all ranks.
+
+    This is the ✅ correct configuration: CP is repurposed as MoE EP.
+    With tp=1 there is a single TP rank per CP slice, so:
+      moe_ep_size = cp_size, moe_tp_size = 1,
+      moe_ep_rank = cp_rank, moe_ep_group = full CP group.
+    No NVLink required — only mapping derivation is verified.
+    """
+    P = R * C
+    if torch.cuda.device_count() < P:
+        pytest.skip(f"needs {P} CUDA devices, have {torch.cuda.device_count()}")
+
+    args = (P, R, C, enable_adp)
+    with MPIPoolExecutor(max_workers=P) as ex:
+        results = list(ex.map(_entrypoint_moe_mapping, *zip(*[args] * P)))
+        for r in results:
+            assert r is True
+
+
+def _run_attn2d_moe_tp2_noadp_check(world_size, rank) -> bool:
+    """Per-rank worker for the ❌ broken-comm tp=2, no-ADP ATTN2D MoE check."""
+    mapping = Mapping(
+        world_size=world_size,
+        rank=rank,
+        tp_size=2,
+        cp_size=2,
+        cp_config={"cp_type": CpType.ATTN2D, "row_size": 2, "col_size": 1},
+        enable_attention_dp=False,
+    )
+    # no-ADP case: moe_tp=2 forces AllGatherReduceScatter in the comm factory.
+    assert mapping.moe_ep_size == 2  # == cp_size
+    assert mapping.moe_tp_size == 2  # == tp_size (no ADP)
+    assert mapping.moe_ep_rank == mapping.cp_rank
+    assert mapping.moe_ep_group == mapping.cp_group
+    assert mapping.moe_tp_group == mapping.tp_group
+    # The broken condition: tp_group != moe_ep_group → allgather uses wrong group.
+    assert mapping.tp_group != mapping.moe_ep_group
+    return True
+
+
+def _run_attn2d_moe_tp2_adp_check(world_size, rank) -> bool:
+    """Per-rank worker for the ✅ fixed tp=2, ADP ATTN2D MoE mapping check.
+
+    ADP fix: moe_ep_size = tp*cp = 4, moe_ep_group = full PP stage [0,1,2,3].
+    moe_ep_rank = tp_rank * cp_size + cp_rank (tp-major, cp-minor) to match
+    tp_cp_allgather ordering.
+
+    Layout for world=4, tp=2, cp=2, pp=1:
+      rank 0: tp_rank=0, cp_rank=0, moe_ep_rank=0
+      rank 1: tp_rank=0, cp_rank=1, moe_ep_rank=1
+      rank 2: tp_rank=1, cp_rank=0, moe_ep_rank=2
+      rank 3: tp_rank=1, cp_rank=1, moe_ep_rank=3
+    """
+    mapping = Mapping(
+        world_size=world_size,
+        rank=rank,
+        tp_size=2,
+        cp_size=2,
+        cp_config={"cp_type": CpType.ATTN2D, "row_size": 2, "col_size": 1},
+        enable_attention_dp=True,
+    )
+    # --- Size derivation ---
+    assert mapping.moe_ep_size == 4, (  # tp*cp
+        f"rank {rank}: moe_ep_size {mapping.moe_ep_size} != 4"
+    )
+    assert mapping.moe_tp_size == 1, f"rank {rank}: moe_tp_size {mapping.moe_tp_size} != 1"
+    assert mapping.moe_cluster_size == 1
+
+    # --- Rank accessors ---
+    expected_ep_rank = mapping.tp_rank * mapping.cp_size + mapping.cp_rank
+    assert mapping.moe_ep_rank == expected_ep_rank, (
+        f"rank {rank}: moe_ep_rank {mapping.moe_ep_rank} != tp_rank*cp+cp_rank = {expected_ep_rank}"
+    )
+    assert mapping.moe_tp_rank == 0
+    # all_rank_num_tokens_rank must match moe_ep_rank for ATTN2D+ADP
+    assert mapping.all_rank_num_tokens_rank == expected_ep_rank, (
+        f"rank {rank}: all_rank_num_tokens_rank {mapping.all_rank_num_tokens_rank} "
+        f"!= moe_ep_rank {expected_ep_rank}"
+    )
+
+    # --- Group membership ---
+    assert mapping.moe_ep_group == [0, 1, 2, 3], (  # full PP stage
+        f"rank {rank}: moe_ep_group {mapping.moe_ep_group} != [0,1,2,3]"
+    )
+    assert mapping.moe_tp_group == [rank], (
+        f"rank {rank}: moe_tp_group {mapping.moe_tp_group} != [{rank}]"
+    )
+    # Mapping now agrees with backend group construction.
+    assert mapping.world_size == mapping.moe_ep_size, (  # 4 == 4
+        f"rank {rank}: world_size {mapping.world_size} != moe_ep_size {mapping.moe_ep_size}"
+    )
+    return True
+
+
+def _entrypoint_moe_tp2_noadp(world_size):
+    rank = tensorrt_llm.mpi_rank()
+    try:
+        return _run_attn2d_moe_tp2_noadp_check(world_size, rank)
+    except Exception:
+        traceback.print_exc()
+        raise
+
+
+def _entrypoint_moe_tp2_adp(world_size):
+    rank = tensorrt_llm.mpi_rank()
+    try:
+        return _run_attn2d_moe_tp2_adp_check(world_size, rank)
+    except Exception:
+        traceback.print_exc()
+        raise
+
+
+@pytest.mark.xfail(
+    strict=False,
+    reason=(
+        "ATTN2D MoE with tp=2, no ADP: moe_tp_size=2 forces "
+        "AllGatherReduceScatter, which dispatches over mapping.tp_group "
+        "instead of moe_ep_group (==cp_group). The EP exchange across CP "
+        "never happens so tokens routed to remote experts are lost. "
+        "Fix requires a 2D MoE comm strategy (EP-alltoall + TP-reduce) "
+        "and corrected EP-subgroup construction in the comm backends."
+    ),
+)
+@pytest.mark.threadleak(enabled=False)
+def test_attn2d_moe_mapping_tp2_noadp_broken_comm_documented():
+    """Document the ❌ broken-comm condition for tp=2 ATTN2D (no ADP).
+
+    The mapping correctly derives moe_ep_group (==cp_group) and
+    moe_tp_group (==tp_group).  The failure is in the comm backends:
+    moe_tp_size=2 causes the factory to return AllGatherReduceScatter,
+    which allgathers over tp_group — not the EP group.
+
+    This test is xfail (strict=False): the mapping assertions themselves
+    pass (the mapping is correct), but the test is marked xfail to
+    document that the full MoE path is broken and to remind developers
+    to wire up a real 2D comm strategy before enabling this config.
+    """
+    P = 4  # tp=2, cp=2
+    if torch.cuda.device_count() < P:
+        pytest.skip(f"needs {P} CUDA devices")
+
+    args = (P,)
+    with MPIPoolExecutor(max_workers=P) as ex:
+        results = list(ex.map(_entrypoint_moe_tp2_noadp, *zip(*[args] * P)))
+        for r in results:
+            assert r is True
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_attn2d_moe_mapping_tp2_adp_fixed():
+    """Verify the ✅ fixed ADP mapping for tp=2, cp=2 ATTN2D MoE.
+
+    After the ep=dp×cp fix: moe_ep_size=4, moe_ep_rank=tp_rank*cp+cp_rank,
+    moe_ep_group=[0,1,2,3].  The mapping now agrees with what DeepEP and
+    NVLinkOneSided already construct (Split spans the PP stage; world==ep).
+
+    Only mapping-level assertions — no NVLink hardware required.
+    """
+    P = 4  # tp=2, cp=2
+    if torch.cuda.device_count() < P:
+        pytest.skip(f"needs {P} CUDA devices")
+
+    args = (P,)
+    with MPIPoolExecutor(max_workers=P) as ex:
+        results = list(ex.map(_entrypoint_moe_tp2_adp, *zip(*[args] * P)))
+        for r in results:
+            assert r is True

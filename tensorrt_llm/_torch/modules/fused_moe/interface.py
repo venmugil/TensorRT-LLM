@@ -985,8 +985,11 @@ class MoE(nn.Module):
         is_nvfp4_input = isinstance(x, Fp4QuantizedTensor)
         assert do_finalize, "Default forward_fake does not support do_finalize=False"
         data_type = output_dtype if is_nvfp4_input else x.dtype
+        # all_rank_num_tokens_rank gives the correct index for this rank in
+        # the all_rank_num_tokens list regardless of ADP configuration.
         num_tokens = all_rank_num_tokens[
-            self.mapping.tp_rank] if all_rank_num_tokens else x.shape[0]
+            self.mapping.
+            all_rank_num_tokens_rank] if all_rank_num_tokens else x.shape[0]
         hidden_size = x.shape[1] * (2 if is_nvfp4_input else 1)
         return x.new_empty((num_tokens, hidden_size), dtype=data_type)
 

@@ -219,7 +219,11 @@ class ExternalCommMoEScheduler(MoEScheduler):
 
         # ========== Step 4: Truncate DP padding ==========
         if moe.use_dp and moe.parallel_size > 1:
-            outputs = outputs[: all_rank_num_tokens[moe.mapping.tp_rank]]
+            # all_rank_num_tokens_rank gives the correct index for this rank in
+            # the all_rank_num_tokens list regardless of comm configuration.
+            # For ATTN2D+ADP the list is tp×cp entries (moe_ep_rank order);
+            # for other ADP configs it is tp entries (tp_rank order).
+            outputs = outputs[: all_rank_num_tokens[moe.mapping.all_rank_num_tokens_rank]]
 
         return outputs
 

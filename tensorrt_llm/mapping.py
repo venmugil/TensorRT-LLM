@@ -93,13 +93,12 @@ class MappingBase:
             cp_type = cp_config.get("cp_type", CpType.ULYSSES)
 
         # For ULYSSES, CP ranks are independent MoE DP replicas so MoE operates
-        # within the TP dimension only.  For ATTN2D without ADP, TP is MoE TP
-        # and CP is MoE EP (experts sharded across CP ranks, no replication).
-        # For ATTN2D with ADP, TP ranks are DP replicas so MoE world is just CP.
+        # within the TP dimension only.  For ATTN2D (with or without ADP), TP
+        # and CP together form the MoE world: CP is always MoE EP; without ADP
+        # TP is MoE TP, with ADP TP is also EP (tokens are unique across all
+        # tp×cp ranks, so there are no DP replicas from MoE's perspective).
         # For HELIX and other CP types, CP folds into TP via repurpose_helix_cp_to_tp().
-        if cp_type == CpType.ATTN2D and enable_attention_dp:
-            moe_world_size = cp_size
-        elif cp_type == CpType.ULYSSES:
+        if cp_type == CpType.ULYSSES:
             moe_world_size = tp_size
         else:
             moe_world_size = tp_size * cp_size
@@ -123,10 +122,12 @@ class MappingBase:
 
             if moe_tp_size == -1 and moe_ep_size == -1:
                 if cp_type == CpType.ATTN2D:
-                    # CP is always MoE EP (experts sharded across CP ranks).
-                    # With ADP, TP ranks are DP replicas so moe_tp=1.
-                    # Without ADP, TP participates in MoE weight sharding (moe_tp=tp).
-                    moe_ep_size = cp_size
+                    # With ADP: tokens are unique across all tp×cp ranks (tp_rank
+                    # selects requests, cp_rank selects positions), so the full
+                    # tp×cp stage is one flat EP group; moe_tp=1.
+                    # Without ADP: TP peers hold identical tokens (TP-replicated);
+                    # CP is EP; TP participates as MoE TP.
+                    moe_ep_size = tp_size * cp_size if enable_attention_dp else cp_size
                     moe_tp_size = 1 if enable_attention_dp else tp_size
                 else:
                     moe_tp_size = moe_world_size // moe_cluster_size
@@ -143,14 +144,18 @@ class MappingBase:
                     raise ValueError(
                         "ATTN2D does not support moe_cluster_size > 1: "
                         "cluster mode requires moe_ep_size=1, but ATTN2D "
-                        "repurposes CP as MoE EP (moe_ep_size=cp_size).")
+                        "repurposes CP as MoE EP.")
+                expected_moe_ep = (tp_size *
+                                   cp_size if enable_attention_dp else cp_size)
                 expected_moe_tp = 1 if enable_attention_dp else tp_size
-                if moe_ep_size != cp_size or moe_tp_size != expected_moe_tp:
+                if moe_ep_size != expected_moe_ep or moe_tp_size != expected_moe_tp:
                     raise ValueError(
-                        f"ATTN2D repurposes CP as MoE EP: moe_ep_size must "
-                        f"equal cp_size={cp_size} and moe_tp_size must equal "
-                        f"{'1 (ADP: TP ranks are DP replicas)' if enable_attention_dp else f'tp_size={tp_size}'}, "
-                        f"got moe_ep_size={moe_ep_size}, moe_tp_size={moe_tp_size}"
+                        f"ATTN2D repurposes CP as MoE EP: "
+                        f"with ADP moe_ep_size must equal tp_size*cp_size="
+                        f"{tp_size * cp_size} and moe_tp_size must equal 1; "
+                        f"without ADP moe_ep_size must equal cp_size={cp_size} "
+                        f"and moe_tp_size must equal tp_size={tp_size}. "
+                        f"Got moe_ep_size={moe_ep_size}, moe_tp_size={moe_tp_size}"
                     )
 
         if attn_tp_size == -1 and attn_cp_size == -1:
@@ -319,8 +324,25 @@ class MappingBase:
         if self._dwdp_size > 1:
             return self._dwdp_moe_ep_rank
         if self.has_cp_attn2d():
+            if self.enable_attention_dp:
+                # ADP: all tp×cp ranks hold distinct tokens; EP spans the full
+                # PP stage. Index is tp-major, cp-minor to match tp_cp_allgather
+                # ordering (communicator.py:tp_cp_allgather).
+                return self.tp_rank * self.cp_size + self.cp_rank
             return self.cp_rank
         return self.tp_rank % self.moe_ep_size
+
+    @property
+    def all_rank_num_tokens_rank(self) -> int:
+        """Index into the all_rank_num_tokens list for this process.
+
+        Matches the gather used in _get_all_rank_num_tokens:
+        - ATTN2D+ADP: tp_cp_allgather order (moe_ep_rank = tp_rank*cp_size + cp_rank)
+        - Others: tp_allgather order (tp_rank)
+        """
+        if self.has_cp_attn2d() and self.enable_attention_dp:
+            return self.moe_ep_rank
+        return self.tp_rank
 
     @property
     def dwdp_size(self) -> int:
@@ -802,8 +824,15 @@ class MpiTopology(Mapping):
 
     @property
     def moe_ep_group(self) -> List[int]:
-        # ATTN2D: CP is repurposed as MoE EP — reuse the existing cp_group.
         if self.has_cp_attn2d():
+            if self.enable_attention_dp:
+                # ADP: EP spans all tp×cp ranks in this PP stage.
+                # Ranks in PP stage pp_rank are [pp_rank*tp*cp, (pp_rank+1)*tp*cp).
+                # Computed inline — no separate group construction needed.
+                stage_size = self.tp_size * self.cp_size
+                start = self.pp_rank * stage_size
+                return list(range(start, start + stage_size))
+            # Non-ADP: CP is MoE EP — reuse the existing cp_group.
             return self.cp_group
         return self.moe_ep_groups[self.pp_rank * self.moe_tp_size *
                                   self.moe_cluster_size +
