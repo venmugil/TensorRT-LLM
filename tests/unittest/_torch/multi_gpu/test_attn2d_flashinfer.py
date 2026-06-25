@@ -895,8 +895,8 @@ def test_attn2d_flashinfer_chunked_prefill(R, C, chunk_offset, L_extra):
 # Coverage:
 #   tp=1, cp=P (no ADP): ✅ correct comm path (moe_tp=1, moe_ep=P)
 #   tp=1, cp=P (ADP):    ✅ correct (moe_tp=1, moe_ep=P, same as no-ADP for tp=1)
-#   tp=2, cp=2 (no ADP): ❌ broken comm — documented here via xfail
-#   tp=2, cp=2 (ADP):    ✅ fixed — moe_ep=tp*cp=4, mapping agrees with backends
+#   tp=2, cp=2 (no ADP): ✅ fixed by D4 SP — moe_ep=tp*cp=4, attn2d_sequence_parallel
+#   tp=2, cp=2 (ADP):    ✅ fixed by D3 — moe_ep=tp*cp=4, mapping agrees with backends
 # ---------------------------------------------------------------------------
 
 
@@ -1005,7 +1005,18 @@ def test_attn2d_moe_mapping_properties_tp1(R, C, enable_adp):
 
 
 def _run_attn2d_moe_tp2_noadp_check(world_size, rank) -> bool:
-    """Per-rank worker for the ❌ broken-comm tp=2, no-ADP ATTN2D MoE check."""
+    """Per-rank worker for the ✅ SP-fixed tp=2, no-ADP ATTN2D MoE mapping check.
+
+    After D4: ATTN2D always uses the unified EP layout (moe_ep=tp*cp=4,
+    moe_tp=1) regardless of ADP.  Sequence parallelism (RS over TP after
+    o_proj) shards tokens across TP → tp×cp distinct shards → alltoall EP.
+
+    Layout for world=4, tp=2, cp=2, pp=1:
+      rank 0: tp_rank=0, cp_rank=0, moe_ep_rank=0
+      rank 1: tp_rank=0, cp_rank=1, moe_ep_rank=1
+      rank 2: tp_rank=1, cp_rank=0, moe_ep_rank=2
+      rank 3: tp_rank=1, cp_rank=1, moe_ep_rank=3
+    """
     mapping = Mapping(
         world_size=world_size,
         rank=rank,
@@ -1014,14 +1025,35 @@ def _run_attn2d_moe_tp2_noadp_check(world_size, rank) -> bool:
         cp_config={"cp_type": CpType.ATTN2D, "row_size": 2, "col_size": 1},
         enable_attention_dp=False,
     )
-    # no-ADP case: moe_tp=2 forces AllGatherReduceScatter in the comm factory.
-    assert mapping.moe_ep_size == 2  # == cp_size
-    assert mapping.moe_tp_size == 2  # == tp_size (no ADP)
-    assert mapping.moe_ep_rank == mapping.cp_rank
-    assert mapping.moe_ep_group == mapping.cp_group
-    assert mapping.moe_tp_group == mapping.tp_group
-    # The broken condition: tp_group != moe_ep_group → allgather uses wrong group.
-    assert mapping.tp_group != mapping.moe_ep_group
+    # --- Size derivation (unified, same as ADP) ---
+    assert mapping.moe_ep_size == 4, f"rank {rank}: moe_ep_size {mapping.moe_ep_size} != 4 (tp*cp)"
+    assert mapping.moe_tp_size == 1, f"rank {rank}: moe_tp_size {mapping.moe_tp_size} != 1"
+    assert mapping.moe_cluster_size == 1
+
+    # --- Rank accessors (tp-major, cp-minor) ---
+    expected_ep_rank = mapping.tp_rank * mapping.cp_size + mapping.cp_rank
+    assert mapping.moe_ep_rank == expected_ep_rank, (
+        f"rank {rank}: moe_ep_rank {mapping.moe_ep_rank} != tp_rank*cp+cp_rank = {expected_ep_rank}"
+    )
+    assert mapping.moe_tp_rank == 0, f"rank {rank}: moe_tp_rank {mapping.moe_tp_rank} != 0"
+    assert mapping.all_rank_num_tokens_rank == expected_ep_rank, (
+        f"rank {rank}: all_rank_num_tokens_rank "
+        f"{mapping.all_rank_num_tokens_rank} != moe_ep_rank {expected_ep_rank}"
+    )
+
+    # --- Group membership ---
+    assert mapping.moe_ep_group == [0, 1, 2, 3], (
+        f"rank {rank}: moe_ep_group {mapping.moe_ep_group} != [0,1,2,3]"
+    )
+    assert mapping.moe_tp_group == [rank], (
+        f"rank {rank}: moe_tp_group {mapping.moe_tp_group} != [{rank}]"
+    )
+
+    # --- SP predicate ---
+    assert mapping.attn2d_sequence_parallel, (
+        f"rank {rank}: attn2d_sequence_parallel should be True for no-ADP tp>1"
+    )
+
     return True
 
 
@@ -1097,30 +1129,17 @@ def _entrypoint_moe_tp2_adp(world_size):
         raise
 
 
-@pytest.mark.xfail(
-    strict=False,
-    reason=(
-        "ATTN2D MoE with tp=2, no ADP: moe_tp_size=2 forces "
-        "AllGatherReduceScatter, which dispatches over mapping.tp_group "
-        "instead of moe_ep_group (==cp_group). The EP exchange across CP "
-        "never happens so tokens routed to remote experts are lost. "
-        "Fix requires a 2D MoE comm strategy (EP-alltoall + TP-reduce) "
-        "and corrected EP-subgroup construction in the comm backends."
-    ),
-)
 @pytest.mark.threadleak(enabled=False)
-def test_attn2d_moe_mapping_tp2_noadp_broken_comm_documented():
-    """Document the ❌ broken-comm condition for tp=2 ATTN2D (no ADP).
+def test_attn2d_moe_mapping_tp2_noadp_sp_fixed():
+    """Verify the ✅ SP-fixed mapping for tp=2, cp=2 ATTN2D MoE (no ADP).
 
-    The mapping correctly derives moe_ep_group (==cp_group) and
-    moe_tp_group (==tp_group).  The failure is in the comm backends:
-    moe_tp_size=2 causes the factory to return AllGatherReduceScatter,
-    which allgathers over tp_group — not the EP group.
+    After D4: sequence parallelism (reduce-scatter over the TP group after
+    o_proj) shards tokens across TP so all tp×cp ranks hold distinct tokens.
+    The mapping is unified: moe_ep=tp*cp=4, moe_tp=1, moe_ep_group=[0,1,2,3],
+    moe_ep_rank=tp_rank*cp+cp_rank (tp-major, cp-minor).
 
-    This test is xfail (strict=False): the mapping assertions themselves
-    pass (the mapping is correct), but the test is marked xfail to
-    document that the full MoE path is broken and to remind developers
-    to wire up a real 2D comm strategy before enabling this config.
+    attn2d_sequence_parallel==True confirms SP is active for this config.
+    Only mapping-level assertions — no NVLink hardware required.
     """
     P = 4  # tp=2, cp=2
     if torch.cuda.device_count() < P:

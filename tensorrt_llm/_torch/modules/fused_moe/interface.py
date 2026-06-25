@@ -348,7 +348,12 @@ class MoE(nn.Module):
         # own _init_load_balancer will gate it.
 
         self.moe_backend = model_config.moe_backend
-        self.use_dp = model_config.mapping.enable_attention_dp
+        # use_dp controls the EP dispatch path: tokens are distinct across all
+        # participating ranks and need alltoall routing to their expert owners.
+        # This is true for ADP (tokens unique by request) and for ATTN2D SP
+        # (tokens unique after TP reduce-scatter, tp>1, no ADP).
+        self.use_dp = (model_config.mapping.enable_attention_dp
+                       or model_config.mapping.attn2d_sequence_parallel)
 
         # All ranks participate in allreduce regardless of EP/TP combination
         self.mapping = model_config.mapping

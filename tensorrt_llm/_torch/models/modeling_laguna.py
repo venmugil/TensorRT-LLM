@@ -30,7 +30,7 @@ from ..attention_backend.interface import (
     RopeParams,
 )
 from ..distributed import AllReduce, AllReduceParams
-from ..modules.attention import _helix_cp_allgather_input, _helix_cp_output_projection
+from ..modules.attention import _cp_sp_allgather_input, _cp_sp_output_projection
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe, get_moe_cls
@@ -350,7 +350,7 @@ class LagunaAttention(QKNormRoPEAttention):
         # position per the HF reference implementation).
         gate_input = hidden_states if self._use_gating else None
 
-        hidden_states = _helix_cp_allgather_input(
+        hidden_states = _cp_sp_allgather_input(
             hidden_states, attn_metadata, self.mapping, self.layer_idx
         )
 
@@ -387,7 +387,7 @@ class LagunaAttention(QKNormRoPEAttention):
             else:
                 attn_output *= gate
 
-        attn_output = _helix_cp_output_projection(
+        attn_output = _cp_sp_output_projection(
             self.o_proj,
             attn_output,
             attn_metadata,

@@ -53,8 +53,8 @@ from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
-from ..modules.attention import (maybe_allgather_for_helix_cp,
-                                 maybe_slice_for_helix_cp)
+from ..modules.attention import (maybe_allgather_for_cp_sp,
+                                 maybe_slice_for_cp_sp)
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, MoE,
@@ -1429,9 +1429,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
-        residual = maybe_slice_for_helix_cp(residual, attn_metadata,
-                                            self.mapping_with_cp,
-                                            self.layer_idx)
+        residual = maybe_slice_for_cp_sp(residual, attn_metadata,
+                                         self.mapping_with_cp, self.layer_idx)
         if isinstance(self.mlp, Deepseekv3MoE):
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
@@ -1823,9 +1822,8 @@ class DeepseekV3Model(DecoderModel):
                 spec_metadata=spec_metadata,
             )
 
-        hidden_states = maybe_allgather_for_helix_cp(hidden_states,
-                                                     attn_metadata,
-                                                     self.mapping_with_cp)
+        hidden_states = maybe_allgather_for_cp_sp(hidden_states, attn_metadata,
+                                                  self.mapping_with_cp)
         return hidden_states
 
 

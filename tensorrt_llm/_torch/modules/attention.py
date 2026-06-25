@@ -15,8 +15,8 @@ from ..attention_backend.interface import (AttentionMask, CustomAttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask)
 from ..attention_backend.utils import create_attention, get_attention_backend
-from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
-                           cp_allgather, reducescatter)
+from ..distributed import (AllReduceParams, HelixAllToAllNative, allgather,
+                           alltoall_helix, cp_allgather, reducescatter)
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
@@ -269,8 +269,8 @@ def _helix_post_process(
                 gathered_o, gathered_stats, 1.0, 1)
 
 
-def _helix_cp_pad(tensor: torch.Tensor, num_tokens: int,
-                  cp_size: int) -> tuple[torch.Tensor, int]:
+def _cp_sp_pad(tensor: torch.Tensor, num_tokens: int,
+               cp_size: int) -> tuple[torch.Tensor, int]:
     """Pad tensor along dim-0 so its length is divisible by cp_size."""
     chunk_size = math.ceil(num_tokens / cp_size)
     padded_size = chunk_size * cp_size
@@ -282,22 +282,35 @@ def _helix_cp_pad(tensor: torch.Tensor, num_tokens: int,
     return tensor, chunk_size
 
 
-def _helix_cp_allgather_input(hidden_states: torch.Tensor,
-                              attn_metadata: AttentionMetadata,
-                              mapping: Mapping, layer_idx: int) -> torch.Tensor:
-    """AllGather hidden states from CP group for layers after the first.
+def _cp_sp_allgather_input(hidden_states: torch.Tensor,
+                           attn_metadata: AttentionMetadata,
+                           mapping: Mapping,
+                           layer_idx: int,
+                           mapping_o: Optional[Mapping] = None) -> torch.Tensor:
+    """AllGather hidden states for layers after the first when SP is active.
 
     The first layer already has the full input from the embedding.
     Subsequent layers need to undo the previous layer's reduce-scatter.
+
+    For Helix CP+DP: gathers across the CP group.
+    For ATTN2D SP (no-ADP, tp>1): gathers across the TP group (mapping_o)
+    to undo the prior layer's TP reduce-scatter, restoring TP-replication
+    before QKV computation.
     """
     if (mapping.has_cp_helix() and mapping.enable_attention_dp
             and layer_idx > 0):
         hidden_states = cp_allgather(hidden_states, mapping, dim=0)
         hidden_states = hidden_states[:attn_metadata.num_tokens]
+    elif (mapping.attn2d_sequence_parallel and layer_idx > 0
+          and mapping_o is not None):
+        # SP: undo the prior layer's TP reduce-scatter by gathering across the
+        # TP group. Slice to num_tokens to remove any padding inserted before RS.
+        hidden_states = allgather(hidden_states, mapping_o, dim=0)
+        hidden_states = hidden_states[:attn_metadata.num_tokens]
     return hidden_states
 
 
-def _helix_cp_output_projection(
+def _cp_sp_output_projection(
     o_proj: Linear,
     attn_output: torch.Tensor,
     attn_metadata: AttentionMetadata,
@@ -307,10 +320,13 @@ def _helix_cp_output_projection(
     layer_idx: int,
     lora_params: Optional[dict] = None,
 ) -> torch.Tensor:
-    """Apply output projection with reduce-scatter when Helix CP+DP is active.
+    """Apply output projection with reduce-scatter when SP is active.
 
-    Reduce-scatter sums partial sums across the CP group and scatters the
-    result so each CP rank processes a distinct token chunk through the MLP.
+    For Helix CP+DP: reduce-scatter sums partial sums across the folded
+    CP∪TP group (via mapping_o) and scatters by CP chunk.
+    For ATTN2D SP (no-ADP, tp>1): reduce-scatter sums partial sums across
+    the TP group (mapping_o) and scatters by TP chunk, so each of the
+    tp×cp ranks holds a distinct token shard for the MoE EP dispatch.
     Falls back to the standard AllReduce path otherwise.
     """
     if mapping.has_cp_helix() and mapping.enable_attention_dp:
@@ -320,8 +336,20 @@ def _helix_cp_output_projection(
             lora_params=lora_params,
             layer_idx=layer_idx)
 
-        attn_output, _ = _helix_cp_pad(attn_output, attn_metadata.num_tokens,
-                                       mapping.cp_size)
+        attn_output, _ = _cp_sp_pad(attn_output, attn_metadata.num_tokens,
+                                    mapping.cp_size)
+        attn_output = reducescatter(attn_output, mapping_o, dim=0)
+    elif mapping.attn2d_sequence_parallel:
+        # SP: replace the TP all-reduce with a reduce-scatter over the TP group
+        # (mapping_o). This shards tokens across TP so all tp×cp ranks hold
+        # distinct tokens for the MoE EP dispatch.
+        attn_output = o_proj(
+            attn_output,
+            all_reduce_params=AllReduceParams(enable_allreduce=False),
+            lora_params=lora_params,
+            layer_idx=layer_idx)
+        attn_output, _ = _cp_sp_pad(attn_output, attn_metadata.num_tokens,
+                                    mapping.tp_size)
         attn_output = reducescatter(attn_output, mapping_o, dim=0)
     else:
         attn_output = o_proj(attn_output,
@@ -332,11 +360,11 @@ def _helix_cp_output_projection(
     return attn_output
 
 
-def maybe_slice_for_helix_cp(tensor: torch.Tensor,
-                             attn_metadata: AttentionMetadata,
-                             mapping_with_cp: Optional[Mapping],
-                             layer_idx: int) -> torch.Tensor:
-    """Slice a tensor to this CP rank's chunk after reduce-scatter.
+def maybe_slice_for_cp_sp(tensor: torch.Tensor,
+                          attn_metadata: AttentionMetadata,
+                          mapping_with_cp: Optional[Mapping],
+                          layer_idx: int) -> torch.Tensor:
+    """Slice a tensor to this rank's chunk after reduce-scatter.
 
     For the first decoder layer, the residual comes from the embedding and
     has not been through a prior reduce-scatter.  This function slices it
@@ -346,32 +374,59 @@ def maybe_slice_for_helix_cp(tensor: torch.Tensor,
 
     Call this in the decoder layer on the residual *after* the attention
     forward, so that Attention/MLA forward signatures stay unchanged.
+
+    For Helix CP+DP: slices by CP chunk.
+    For ATTN2D SP (no-ADP, tp>1): slices by TP chunk so the residual aligns
+    with the TP-reduce-scattered attention output at the first layer.
     """
     if (mapping_with_cp is not None and mapping_with_cp.has_cp_helix()
             and mapping_with_cp.enable_attention_dp and layer_idx == 0):
-        tensor, chunk_size = _helix_cp_pad(tensor, attn_metadata.num_tokens,
-                                           mapping_with_cp.cp_size)
+        tensor, chunk_size = _cp_sp_pad(tensor, attn_metadata.num_tokens,
+                                        mapping_with_cp.cp_size)
         start = mapping_with_cp.cp_rank * chunk_size
+        tensor = tensor[start:start + chunk_size]
+    elif (mapping_with_cp is not None
+          and mapping_with_cp.attn2d_sequence_parallel and layer_idx == 0):
+        # SP: at the first layer the residual (from embedding) is full-size.
+        # Slice it to align with the TP-reduce-scattered attention output.
+        chunk_size = math.ceil(attn_metadata.num_tokens /
+                               mapping_with_cp.tp_size)
+        padded_size = chunk_size * mapping_with_cp.tp_size
+        if attn_metadata.num_tokens < padded_size:
+            tensor = torch.nn.functional.pad(
+                tensor, (0, 0, 0, padded_size - attn_metadata.num_tokens),
+                mode="constant",
+                value=0)
+        start = mapping_with_cp.tp_rank * chunk_size
         tensor = tensor[start:start + chunk_size]
     return tensor
 
 
-def maybe_allgather_for_helix_cp(
-        hidden_states: torch.Tensor, attn_metadata: AttentionMetadata,
-        mapping_with_cp: Optional[Mapping]) -> torch.Tensor:
+def maybe_allgather_for_cp_sp(
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        mapping_with_cp: Optional[Mapping],
+        mapping_o: Optional[Mapping] = None) -> torch.Tensor:
     """Restore full token count after the last layer's reduce-scatter.
 
-    With Helix CP + Attention DP, each decoder layer's reduce-scatter
-    leaves each CP rank with only its chunk of tokens.  This function
-    performs an AllGather across the CP group so that the LM head (and
-    final norm) see every token.
-
     Should be called at the end of the model's ``forward()`` method,
-    after the decoder layer loop.
+    after the decoder layer loop. A no-op when neither SP mode is active.
+
+    For Helix CP+DP: AllGather across the CP group so the LM head (and
+    final norm) sees every token.
+    For ATTN2D SP (no-ADP, tp>1): AllGather across the TP group (mapping_o)
+    so the LM head sees all tokens after the last layer's TP reduce-scatter.
     """
     if (mapping_with_cp is not None and mapping_with_cp.has_cp_helix()
             and mapping_with_cp.enable_attention_dp):
         hidden_states = cp_allgather(hidden_states, mapping_with_cp, dim=0)
+        hidden_states = hidden_states[:attn_metadata.num_tokens]
+    elif (mapping_with_cp is not None
+          and mapping_with_cp.attn2d_sequence_parallel
+          and mapping_o is not None):
+        # SP: undo the final layer's TP reduce-scatter so the LM head sees
+        # all tokens. Gather across the TP group (mapping_o).
+        hidden_states = allgather(hidden_states, mapping_o, dim=0)
         hidden_states = hidden_states[:attn_metadata.num_tokens]
     return hidden_states
 
@@ -999,8 +1054,9 @@ class Attention(nn.Module):
         Returns:
             torch.Tensor: The output tensor.
         """
-        hidden_states = _helix_cp_allgather_input(hidden_states, attn_metadata,
-                                                  self.mapping, self.layer_idx)
+        hidden_states = _cp_sp_allgather_input(hidden_states, attn_metadata,
+                                               self.mapping, self.layer_idx,
+                                               self.mapping_o)
 
         qkv = self.qkv_proj(hidden_states)
 
@@ -1069,11 +1125,10 @@ class Attention(nn.Module):
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
 
-        attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
-                                                  attn_metadata,
-                                                  all_reduce_params,
-                                                  self.mapping, self.mapping_o,
-                                                  self.layer_idx, lora_params)
+        attn_output = _cp_sp_output_projection(self.o_proj, attn_output,
+                                               attn_metadata, all_reduce_params,
+                                               self.mapping, self.mapping_o,
+                                               self.layer_idx, lora_params)
         return attn_output
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
@@ -1126,3 +1181,4 @@ class Attention(nn.Module):
         raise NotImplementedError(
             f"QK norm is not implemented for {self.__class__.__name__}. "
             "Please override the `apply_qk_norm` method in the subclass.")
+

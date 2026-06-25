@@ -122,13 +122,15 @@ class MappingBase:
 
             if moe_tp_size == -1 and moe_ep_size == -1:
                 if cp_type == CpType.ATTN2D:
+                    # CP is always MoE EP for ATTN2D regardless of ADP.
                     # With ADP: tokens are unique across all tp×cp ranks (tp_rank
                     # selects requests, cp_rank selects positions), so the full
                     # tp×cp stage is one flat EP group; moe_tp=1.
-                    # Without ADP: TP peers hold identical tokens (TP-replicated);
-                    # CP is EP; TP participates as MoE TP.
-                    moe_ep_size = tp_size * cp_size if enable_attention_dp else cp_size
-                    moe_tp_size = 1 if enable_attention_dp else tp_size
+                    # Without ADP + tp>1: sequence parallelism (SP) — o_proj
+                    # reduce-scatter shards tokens across the TP group, making all
+                    # tp×cp ranks hold distinct tokens.  Same moe_ep=tp×cp layout.
+                    moe_ep_size = tp_size * cp_size
+                    moe_tp_size = 1
                 else:
                     moe_tp_size = moe_world_size // moe_cluster_size
                     moe_ep_size = 1
@@ -145,18 +147,46 @@ class MappingBase:
                         "ATTN2D does not support moe_cluster_size > 1: "
                         "cluster mode requires moe_ep_size=1, but ATTN2D "
                         "repurposes CP as MoE EP.")
-                expected_moe_ep = (tp_size *
-                                   cp_size if enable_attention_dp else cp_size)
-                expected_moe_tp = 1 if enable_attention_dp else tp_size
+                expected_moe_ep = tp_size * cp_size
+                expected_moe_tp = 1
+                # Why moe_tp_size must be 1 for ATTN2D (3-layer structural
+                # constraint — do not relax without implementing all three):
+                #
+                # 1. Token distribution: ATTN2D sequence-parallel (SP) makes all
+                #    tp×cp ranks hold DISTINCT tokens (o_proj reduce-scatter over
+                #    TP + CP positional sharding).  moe_tp>1 requires tokens to be
+                #    REPLICATED across the moe_tp sub-group so each peer computes a
+                #    weight-slice of the same tokens and they all-reduce.  That is
+                #    the opposite of what SP produces.
+                #
+                # 2. Comm strategy gap: AllGatherReduceScatter (the only strategy
+                #    available when moe_tp>1 — communication_factory.py:113-116)
+                #    runs over mapping.tp_group (tp_size ranks only) and cannot
+                #    cover the tp×cp MoE world.  AlltoAll / DeepEP hard-block
+                #    moe_tp>1 (fused_moe_cutlass.py:525-527).  A new 2D
+                #    "EP-alltoall + TP-reduce" strategy is required.
+                #
+                # 3. Mapping stubs: moe_tp_group returns [rank] (singleton),
+                #    moe_tp_rank is hardcoded 0, and _init_parallel_groups skips
+                #    moe_tp_groups construction for ATTN2D — weight sharding and
+                #    the TP-reduce collective would both silently be no-ops.
+                #
+                # To support moe_tp>1: implement (a) the new comm strategy,
+                # (b) real moe_tp_group/moe_tp_rank construction in mapping.py,
+                # (c) partial SP (scatter over tp/moe_tp ranks, not all tp),
+                # (d) matching token-count bookkeeping in model_engine.py.
                 if moe_ep_size != expected_moe_ep or moe_tp_size != expected_moe_tp:
                     raise ValueError(
-                        f"ATTN2D repurposes CP as MoE EP: "
-                        f"with ADP moe_ep_size must equal tp_size*cp_size="
-                        f"{tp_size * cp_size} and moe_tp_size must equal 1; "
-                        f"without ADP moe_ep_size must equal cp_size={cp_size} "
-                        f"and moe_tp_size must equal tp_size={tp_size}. "
-                        f"Got moe_ep_size={moe_ep_size}, moe_tp_size={moe_tp_size}"
-                    )
+                        f"ATTN2D MoE requires moe_ep_size=tp_size*cp_size="
+                        f"{tp_size * cp_size} and moe_tp_size=1. "
+                        f"Got moe_ep_size={moe_ep_size}, "
+                        f"moe_tp_size={moe_tp_size}. "
+                        f"Reason: ATTN2D sequence parallelism produces distinct "
+                        f"tokens across all tp×cp ranks; moe_tp>1 would require "
+                        f"replicated tokens across a moe_tp sub-group plus a new "
+                        f"EP-alltoall+TP-reduce 2D comm strategy that does not "
+                        f"exist yet. See the block comment above this check for "
+                        f"the full 3-layer constraint.")
 
         if attn_tp_size == -1 and attn_cp_size == -1:
             if cp_type == CpType.ULYSSES:
@@ -307,9 +337,8 @@ class MappingBase:
     @property
     def moe_tp_rank(self):
         if self.has_cp_attn2d():
-            # ADP: moe_tp_size=1 so rank is always 0.
-            # Non-ADP: moe_tp_size=tp_size so rank equals tp_rank.
-            return 0 if self.enable_attention_dp else self.tp_rank
+            # moe_tp_size=1 always for ATTN2D; rank is always 0.
+            return 0
         return self.tp_rank // (self.moe_ep_size * self.moe_cluster_size)
 
     @property
@@ -324,12 +353,9 @@ class MappingBase:
         if self._dwdp_size > 1:
             return self._dwdp_moe_ep_rank
         if self.has_cp_attn2d():
-            if self.enable_attention_dp:
-                # ADP: all tp×cp ranks hold distinct tokens; EP spans the full
-                # PP stage. Index is tp-major, cp-minor to match tp_cp_allgather
-                # ordering (communicator.py:tp_cp_allgather).
-                return self.tp_rank * self.cp_size + self.cp_rank
-            return self.cp_rank
+            # EP always spans tp×cp for ATTN2D. Index is tp-major, cp-minor to
+            # match tp_cp_allgather ordering (communicator.py:tp_cp_allgather).
+            return self.tp_rank * self.cp_size + self.cp_rank
         return self.tp_rank % self.moe_ep_size
 
     @property
@@ -337,10 +363,10 @@ class MappingBase:
         """Index into the all_rank_num_tokens list for this process.
 
         Matches the gather used in _get_all_rank_num_tokens:
-        - ATTN2D+ADP: tp_cp_allgather order (moe_ep_rank = tp_rank*cp_size + cp_rank)
+        - ATTN2D (ADP or SP): tp_cp_allgather order (moe_ep_rank = tp_rank*cp_size + cp_rank)
         - Others: tp_allgather order (tp_rank)
         """
-        if self.has_cp_attn2d() and self.enable_attention_dp:
+        if self.has_cp_attn2d():
             return self.moe_ep_rank
         return self.tp_rank
 
@@ -386,6 +412,19 @@ class MappingBase:
     def has_cp_attn2d(self):
         return self.cp_size > 1 and self.cp_config.get(
             "cp_type") == CpType.ATTN2D
+
+    @property
+    def attn2d_sequence_parallel(self) -> bool:
+        """True when ATTN2D sequence-parallel (SP) mode is active.
+
+        SP is active when ATTN2D is enabled, attention-DP is off, and tp>1.
+        In this mode, the o_proj all-reduce is replaced by a reduce-scatter
+        over the TP group (via ``mapping_o``), sharding tokens across TP peers.
+        Combined with CP's token sharding, all tp×cp ranks then hold distinct
+        tokens, enabling moe_ep=tp×cp without DP-replicated experts.
+        """
+        return (self.has_cp_attn2d() and not self.enable_attention_dp
+                and self.tp_size > 1)
 
     @property
     def attn2d_row_size(self) -> int:
@@ -814,9 +853,8 @@ class MpiTopology(Mapping):
     @property
     def moe_tp_group(self) -> List[int]:
         if self.has_cp_attn2d():
-            # ADP: TP ranks are DP replicas (moe_tp_size=1), singleton group.
-            # Non-ADP: TP is MoE TP, reuse existing tp_group.
-            return [self.rank] if self.enable_attention_dp else self.tp_group
+            # moe_tp_size=1 always for ATTN2D; singleton group.
+            return [self.rank]
         return self.moe_tp_groups[self.pp_rank * self.moe_cluster_size *
                                   self.moe_ep_size +
                                   self.moe_cluster_rank * self.moe_ep_size +
@@ -825,15 +863,12 @@ class MpiTopology(Mapping):
     @property
     def moe_ep_group(self) -> List[int]:
         if self.has_cp_attn2d():
-            if self.enable_attention_dp:
-                # ADP: EP spans all tp×cp ranks in this PP stage.
-                # Ranks in PP stage pp_rank are [pp_rank*tp*cp, (pp_rank+1)*tp*cp).
-                # Computed inline — no separate group construction needed.
-                stage_size = self.tp_size * self.cp_size
-                start = self.pp_rank * stage_size
-                return list(range(start, start + stage_size))
-            # Non-ADP: CP is MoE EP — reuse the existing cp_group.
-            return self.cp_group
+            # EP spans all tp×cp ranks in this PP stage for ATTN2D (ADP or SP).
+            # Ranks in PP stage pp_rank are [pp_rank*tp*cp, (pp_rank+1)*tp*cp).
+            # Computed inline — no separate group construction needed.
+            stage_size = self.tp_size * self.cp_size
+            start = self.pp_rank * stage_size
+            return list(range(start, start + stage_size))
         return self.moe_ep_groups[self.pp_rank * self.moe_tp_size *
                                   self.moe_cluster_size +
                                   self.moe_tp_rank * self.moe_cluster_size +

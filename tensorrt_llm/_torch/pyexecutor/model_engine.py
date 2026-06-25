@@ -2549,6 +2549,15 @@ class PyTorchModelEngine(ModelEngine):
                 # tp_cp_allgather produces exactly that ordering.
                 return list(self.dist.tp_cp_allgather(num_tokens))
             return list(self.dist.tp_allgather(num_tokens))
+        if self.mapping.attn2d_sequence_parallel:
+            # ATTN2D no-ADP with SP (tp>1): o_proj reduce-scatter shards tokens
+            # across the TP group. Report the post-RS token count per rank so
+            # the MoE EP dispatch can route correctly across all tp×cp ranks.
+            # tp_cp_allgather produces tp-major/cp-minor ordering matching
+            # moe_ep_rank = tp_rank*cp_size + cp_rank.
+            num_tokens = math.ceil(attn_metadata.num_tokens /
+                                   self.mapping.tp_size)
+            return list(self.dist.tp_cp_allgather(num_tokens))
         return None
 
     def _get_all_rank_ctx_requests(self, num_ctx_requests: int):

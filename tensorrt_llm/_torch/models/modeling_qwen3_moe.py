@@ -11,6 +11,7 @@ from ..attention_backend import AttentionMetadata
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams)
 from ..model_config import ModelConfig
+from ..modules.attention import maybe_allgather_for_cp_sp, maybe_slice_for_cp_sp
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
@@ -99,8 +100,12 @@ class Qwen3MoE(nn.Module):
         self.top_k = config.num_experts_per_tok
         self.enable_attention_dp = model_config.mapping.enable_attention_dp
         self.mapping = model_config.mapping
+        # use_dp: tokens are distinct across all participating ranks (ADP or SP).
+        # When use_dp=True the MoE EP strategy handles combine; no extra allreduce.
+        self.use_dp = (self.enable_attention_dp
+                       or self.mapping.attn2d_sequence_parallel)
         self.allreduce = None
-        if not self.enable_attention_dp and self.mapping.tp_size > 1:
+        if not self.use_dp and self.mapping.tp_size > 1:
             self.allreduce = AllReduce(mapping=model_config.mapping,
                                        strategy=model_config.allreduce_strategy)
 
@@ -156,7 +161,7 @@ class Qwen3MoE(nn.Module):
         if not do_finalize:
             return final_hidden_states
 
-        if not self.enable_attention_dp and self.mapping.tp_size > 1:
+        if not self.use_dp and self.mapping.tp_size > 1:
             final_hidden_states = self.allreduce(
                 final_hidden_states, all_reduce_params=all_reduce_params)
 
@@ -173,12 +178,15 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         config = model_config.pretrained_config
         self.mapping = model_config.mapping
         self.enable_attention_dp = self.mapping.enable_attention_dp
-        self.self_attn = Qwen3Attention(
-            model_config,
-            layer_idx=layer_idx,
-            disable_deep_gemm=True,
-            reduce_output=not self.enable_attention_dp
-            and self.mapping.tp_size > 1)
+        # SP active: no-ADP ATTN2D with tp>1. o_proj uses reduce-scatter instead
+        # of all-reduce, sharding tokens across TP for EP dispatch across tp×cp.
+        # use_dp: tokens are distinct across all participating ranks (ADP or SP).
+        self.use_dp = self.enable_attention_dp or self.mapping.attn2d_sequence_parallel
+        self.self_attn = Qwen3Attention(model_config,
+                                        layer_idx=layer_idx,
+                                        disable_deep_gemm=True,
+                                        reduce_output=not self.use_dp
+                                        and self.mapping.tp_size > 1)
 
         self.mlp = Qwen3MoE(model_config, aux_stream_dict, layer_idx=layer_idx)
 
@@ -192,7 +200,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
 
         self.allreduce = None
-        if not self.enable_attention_dp and self.mapping.tp_size > 1:
+        if not self.use_dp and self.mapping.tp_size > 1:
             self.allreduce = AllReduce(mapping=model_config.mapping,
                                        strategy=model_config.allreduce_strategy)
         self.next_layer_layernorm: RMSNorm = None
@@ -202,18 +210,23 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         self.fusion_config = EagerFusionConfig()
         self.enable_fusion = os.environ.get(
             "TRTLLM_QWEN3_EAGER_FUSION_DISABLED", "0") == "0"
-        self.enable_fusion &= not self.enable_attention_dp
+        # Disable fusion under ADP or SP: the fused RESIDUAL_RMS_NORM+allreduce
+        # kernel assumes allreduce → replicated tokens, which is invalid when
+        # tokens are reduce-scattered across TP (SP) or are DP-distinct (ADP).
+        self.enable_fusion &= not self.use_dp
 
         has_tp = self.mapping.has_tp()
         has_pp = self.mapping.has_pp()
 
         self.fusion_config.PRE_MOE_FUSION = self.enable_fusion and has_tp
         self.fusion_config.POST_MOE_FUSION = self.fusion_config.PRE_MOE_FUSION and not has_pp
+        # Under SP, o_proj does reduce-scatter (not allreduce); the allreduce
+        # after attention must not fire. Disable it the same way ADP does.
         self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
                                        or self.mapping.tp_size == 1
-                                       or self.enable_attention_dp)
+                                       or self.use_dp)
         self.moe_allreduce = None
-        if not self.enable_attention_dp and self.mapping.tp_size > 1:
+        if not self.use_dp and self.mapping.tp_size > 1:
             self.moe_allreduce = MoEAllReduce(mapping=model_config.mapping)
 
     def forward(
@@ -243,6 +256,13 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
             mrope_config=mrope_config,
             **kwargs,
         )
+
+        # SP: at the first layer the residual comes from the embedding and has
+        # not yet been reduce-scattered. Slice it to match the TP-scattered
+        # attention output so both have the same token dimension.
+        if self.mapping.attn2d_sequence_parallel:
+            residual = maybe_slice_for_cp_sp(residual, attn_metadata,
+                                             self.mapping, self.layer_idx)
 
         if self.fusion_config.PRE_MOE_FUSION:
             hidden_states, residual = self.allreduce(
@@ -400,6 +420,15 @@ class Qwen3MoEModel(DecoderModel):
                 mrope_config=mrope_config,
                 deepstack_embeds=deepstack_embeds,
                 **kwargs)
+
+        # SP: undo the final layer's TP reduce-scatter so the LM head sees all
+        # tokens. The mapping_o from the first layer's attention is the TP group
+        # for ATTN2D and is the same across all layers.
+        mapping_o = (self.layers[0].self_attn.mapping_o
+                     if self.layers else None)
+        hidden_states = maybe_allgather_for_cp_sp(hidden_states, attn_metadata,
+                                                  self.model_config.mapping,
+                                                  mapping_o)
         return hidden_states
 
 
