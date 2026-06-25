@@ -26,11 +26,9 @@ from tensorrt_llm._torch.models.modeling_multimodal_mixin import (
     MultimodalModelMixin, PreparedLlmInputs)
 from tensorrt_llm._torch.models.modeling_multimodal_utils import (
     _MULTIMODAL_ENV_NAME, _is_mm_disagg)
-from tensorrt_llm._torch.models.modeling_utils import (DecoderModel,
-                                                       DecoderModelForCausalLM,
-                                                       _load_weights_impl,
-                                                       filter_weights,
-                                                       register_auto_model)
+from tensorrt_llm._torch.models.modeling_utils import (
+    DecoderModel, DecoderModelForCausalLM, _load_weights_impl,
+    attn2d_dense_ffn_defaults, filter_weights, register_auto_model)
 from tensorrt_llm._torch.modules.attention import Attention
 from tensorrt_llm._torch.modules.decoder_layer import DecoderLayer
 from tensorrt_llm._torch.modules.embedding import Embedding
@@ -123,6 +121,7 @@ class MistralDecoderLayer(DecoderLayer):
         super().__init__()
         config = model_config.pretrained_config
         self.layer_idx = layer_idx
+        self.enable_attention_dp = model_config.mapping.enable_attention_dp
 
         self.self_attn = MistralAttention(
             model_config,
@@ -135,6 +134,7 @@ class MistralDecoderLayer(DecoderLayer):
             bias=False,
             dtype=config.torch_dtype,
             config=model_config,
+            overridden_tp_size=1 if self.enable_attention_dp else None,
         )
         self.input_layernorm = RMSNorm(
             hidden_size=config.hidden_size,
@@ -244,6 +244,13 @@ class MistralModel(DecoderModel):
 
 @register_auto_model("MistralForCausalLM")
 class MistralForCausalLM(DecoderModelForCausalLM[MistralModel, MistralConfig]):
+
+    @classmethod
+    def get_model_defaults(cls, llm_args) -> dict:
+        """Mark the mapping dense_ffn under ATTN2D so the MoE-specific
+        sequence-parallel o_proj reduce-scatter is suppressed; the FFN
+        runs as standard tp-way TP GatedMLP on each rank's CP token shard."""
+        return attn2d_dense_ffn_defaults(llm_args)
 
     def __init__(
         self,

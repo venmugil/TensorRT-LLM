@@ -776,6 +776,21 @@ def register_auto_model(name: str):
     return decorator
 
 
+def attn2d_dense_ffn_defaults(llm_args) -> dict:
+    """Return ``{"cp_config": {"dense_ffn": True}}`` when *llm_args* selects ATTN2D CP.
+
+    Dense (non-MoE) models register this via ``get_model_defaults`` so that
+    ``Mapping.attn2d_sequence_parallel`` is False and the FFN runs as a standard
+    TP-sharded GatedMLP on each rank's CP token shard instead of using the MoE
+    o_proj reduce-scatter path.
+    """
+    from tensorrt_llm.llmapi.llm_args import CpType
+    if (llm_args.cp_config is not None
+            and llm_args.cp_config.cp_type == CpType.ATTN2D):
+        return {"cp_config": {"dense_ffn": True}}
+    return {}
+
+
 def register_vision_encoder(
     vision_encoder_cls: Type[nn.Module],
     vlm_base_model: Optional[Type[nn.Module]] = None,

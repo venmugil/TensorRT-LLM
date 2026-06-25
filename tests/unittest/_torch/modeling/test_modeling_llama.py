@@ -777,13 +777,15 @@ class TestLlamaModelDefaults(unittest.TestCase):
             LlamaForCausalLM.get_model_defaults(self._make_no_cp_args()), {})
 
     def test_mistral_attn2d_sets_dense_ffn(self):
-        from tensorrt_llm._torch.models.modeling_llama import MistralForCausalLM
+        from tensorrt_llm._torch.models.modeling_mistral import \
+            MistralForCausalLM
         defaults = MistralForCausalLM.get_model_defaults(
             self._make_attn2d_args())
         self.assertEqual(defaults, {"cp_config": {"dense_ffn": True}})
 
     def test_mistral_non_attn2d_returns_empty(self):
-        from tensorrt_llm._torch.models.modeling_llama import MistralForCausalLM
+        from tensorrt_llm._torch.models.modeling_mistral import \
+            MistralForCausalLM
         self.assertEqual(
             MistralForCausalLM.get_model_defaults(self._make_non_attn2d_args()),
             {})

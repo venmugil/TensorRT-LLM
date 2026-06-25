@@ -1171,3 +1171,179 @@ def test_attn2d_moe_mapping_tp2_adp_fixed():
         results = list(ex.map(_entrypoint_moe_tp2_adp, *zip(*[args] * P)))
         for r in results:
             assert r is True
+
+
+# ---------------------------------------------------------------------------
+# Dense FFN forward tests (BUG 1 fix verification)
+#
+# These tests verify that GatedMLP in a dense ATTN2D decoder layer produces
+# numerically correct output after the fix that passes overridden_tp_size=1
+# when enable_attention_dp=True (modeling_llama.py / modeling_mistral.py).
+#
+# Coverage:
+#   ADP  (tp=2, cp=2): overridden_tp_size=1 → each rank runs the full FFN on
+#   its own token shard (dp×cp-distinct tokens).  Without the fix the weights
+#   are TP-sharded (local_size = intermediate//2) but the allreduce is
+#   disabled, so each rank emits only 1/2 of the correct output.
+#
+#   no-ADP (tp=2, cp=2, dense_ffn=True): overridden_tp_size=None → standard
+#   TP-sharded GatedMLP + allreduce within the tp_group.  Verifies the no-ADP
+#   path still produces correct output after the ADP fix.
+#
+# Both cases compare against a single-GPU reference: the full unsharded FFN
+# applied to each rank's own input token shard.
+# ---------------------------------------------------------------------------
+
+
+@torch.inference_mode()
+def _run_dense_ffn_check(
+    world_size: int,
+    rank: int,
+    R: int,
+    C: int,
+    enable_adp: bool,
+    hidden: int,
+    intermediate: int,
+    dtype_name: str,
+    seed: int,
+) -> None:
+    """Per-rank worker: verify GatedMLP correctness for ADP and no-ADP cases.
+
+    Weights are generated deterministically with the same seed on every rank.
+    For ADP (overridden_tp_size=1) the Linear layers are full-width and each
+    rank independently applies the FFN to its own token shard; the output
+    must match a single-GPU reference with the same weights and input.
+    For no-ADP (tp_size=2) the Linear layers are TP-sharded and the allreduce
+    within the tp_group yields the same result as the full-width reference.
+    """
+    import torch.nn.functional as F
+
+    from tensorrt_llm._torch.distributed import AllReduceParams
+    from tensorrt_llm._torch.model_config import ModelConfig
+    from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+
+    dtype = getattr(torch, dtype_name)
+    tp_size = R
+    cp_size = C
+    assert world_size == tp_size * cp_size
+
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+
+    cp_config = {"cp_type": CpType.ATTN2D, "row_size": R, "col_size": 1}
+    if not enable_adp:
+        cp_config["dense_ffn"] = True
+
+    mapping = Mapping(
+        world_size=world_size,
+        rank=rank,
+        tp_size=tp_size,
+        cp_size=cp_size,
+        enable_attention_dp=enable_adp,
+        cp_config=cp_config,
+    )
+    model_config = ModelConfig(mapping=mapping)
+
+    # ADP: each of the tp×cp ranks has distinct tokens (ep_rank-unique seed).
+    # no-ADP: ranks with the same cp_rank share the same token shard.
+    ep_rank = mapping.tp_rank * cp_size + mapping.cp_rank
+    token_shard_id = ep_rank if enable_adp else mapping.cp_rank
+    L_local = 8
+    gen_x = torch.Generator().manual_seed(seed + token_shard_id + 1)
+    x_local = torch.randn(L_local, hidden, dtype=dtype, generator=gen_x).to(device)
+
+    # GatedMLP: BUG 1 fix passes overridden_tp_size=1 when ADP is on.
+    overridden_tp_size = 1 if enable_adp else None
+    mlp = GatedMLP(
+        hidden_size=hidden,
+        intermediate_size=intermediate,
+        bias=False,
+        dtype=dtype,
+        config=model_config,
+        overridden_tp_size=overridden_tp_size,
+    ).to(device)
+
+    # Deterministic full weights — same generator state on every rank.
+    # load_weights shards automatically based on tp_rank for the no-ADP case;
+    # for ADP (tp=1 override) all ranks get the identical full weight.
+    gen_w = torch.Generator().manual_seed(seed)
+    gate_full = torch.randn(intermediate, hidden, dtype=dtype, generator=gen_w).to(device)
+    up_full = torch.randn(intermediate, hidden, dtype=dtype, generator=gen_w).to(device)
+    down_full = torch.randn(hidden, intermediate, dtype=dtype, generator=gen_w).to(device)
+    mlp.gate_up_proj.load_weights([{"weight": gate_full}, {"weight": up_full}])
+    mlp.down_proj.load_weights([{"weight": down_full}])
+
+    # Forward: allreduce enabled (no-op for ADP since tp=1; real TP reduce for no-ADP).
+    output = mlp(x_local, final_all_reduce_params=AllReduceParams(enable_allreduce=True))
+
+    # Reference: unsharded single-GPU FFN with the same full weights.
+    # Column-parallel + row-parallel + allreduce is algebraically equivalent to:
+    #   h = silu(x @ gate_full.T) * (x @ up_full.T)
+    #   ref = h @ down_full.T
+    h1_gate = x_local @ gate_full.T  # (L, intermediate)
+    h1_up = x_local @ up_full.T  # (L, intermediate)
+    h2 = F.silu(h1_gate) * h1_up  # (L, intermediate)
+    ref_out = h2 @ down_full.T  # (L, hidden)
+
+    atol = 1e-2 if dtype == torch.bfloat16 else 1e-3
+    rtol = 1e-2 if dtype == torch.bfloat16 else 1e-3
+    assert output.shape == ref_out.shape, (
+        f"rank {rank} (tp={mapping.tp_rank}, cp={mapping.cp_rank}, adp={enable_adp}): "
+        f"shape mismatch {output.shape} vs {ref_out.shape}"
+    )
+    torch.testing.assert_close(
+        output,
+        ref_out,
+        atol=atol,
+        rtol=rtol,
+        msg=f"rank {rank} (tp={mapping.tp_rank}, cp={mapping.cp_rank}, adp={enable_adp})",
+    )
+
+
+def _entrypoint_dense_ffn(world_size, R, C, enable_adp, hidden, intermediate, dtype_name, seed):
+    """MPIPoolExecutor entry for the dense FFN forward test."""
+    rank = tensorrt_llm.mpi_rank()
+    try:
+        _run_dense_ffn_check(
+            world_size, rank, R, C, enable_adp, hidden, intermediate, dtype_name, seed
+        )
+    except Exception:
+        traceback.print_exc()
+        raise
+    return True
+
+
+@pytest.mark.parametrize("enable_adp", [True, False], ids=["adp", "no_adp"])
+@pytest.mark.threadleak(enabled=False)
+def test_attn2d_dense_ffn_forward(enable_adp):
+    """Dense GatedMLP under ATTN2D must produce correct output for ADP and no-ADP.
+
+    ADP case (BUG 1 regression guard): the fix passes overridden_tp_size=1 to
+    GatedMLP so each rank holds the full FFN weights and processes its own
+    dp×cp-distinct token shard.  Without the fix, GatedMLP keeps tp_size=2-
+    sharded weights but the allreduce is disabled, so each rank emits the
+    wrong 1/tp partial result.
+
+    no-ADP case (dense_ffn): standard tp_size=2-sharded GatedMLP with allreduce
+    within the tp_group; verifies the no-ADP path still matches the reference
+    after the ADP fix.
+
+    Both cases use world_size=4 (tp=2, cp=2) and compare locally on each rank
+    against an unsharded single-GPU reference FFN with the same deterministic
+    weights and per-rank input.
+    """
+    P = 4  # tp=2, cp=2
+    R, C = 2, 2
+    if torch.cuda.device_count() < P:
+        pytest.skip(f"needs {P} CUDA devices, have {torch.cuda.device_count()}")
+
+    hidden = 64
+    intermediate = 128
+    dtype_name = "bfloat16"
+    seed = 0xFFD00
+
+    args = (P, R, C, enable_adp, hidden, intermediate, dtype_name, seed)
+    with MPIPoolExecutor(max_workers=P) as ex:
+        results = list(ex.map(_entrypoint_dense_ffn, *zip(*[args] * P)))
+        for r in results:
+            assert r is True

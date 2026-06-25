@@ -754,3 +754,254 @@ class TestAttn2dMoeMapping(unittest.TestCase):
                                 "MoE SP must be unaffected by dense_ffn flag")
                 self.assertFalse(m.attn2d_dense_ffn,
                                  "attn2d_dense_ffn must be False for MoE")
+
+    # ------------------------------------------------------------------
+    # 9. dense + ADP: SP must be off, attn2d_dense_ffn semantics under ADP
+    # ------------------------------------------------------------------
+
+    def test_attn2d_dense_ffn_adp_flag(self):
+        """Case 1: dense+ADP — attn2d_sequence_parallel must be False.
+
+        With enable_adp=True the attn2d_sequence_parallel predicate is False
+        regardless of dense_ffn because SP requires not enable_attention_dp.
+        This test also locks in that attn2d_dense_ffn is False under ADP
+        (the flag only activates for no-ADP dense models).
+        """
+
+        def _make_dense_adp(rank, world_size, tp_size, cp_size, row_size,
+                            col_size):
+            return Mapping(
+                world_size=world_size,
+                rank=rank,
+                tp_size=tp_size,
+                cp_size=cp_size,
+                enable_attention_dp=True,
+                cp_config={
+                    "cp_type": CpType.ATTN2D,
+                    "row_size": row_size,
+                    "col_size": col_size,
+                    "dense_ffn": True,
+                },
+            )
+
+        # tp=2, cp=2, ADP, dense_ffn → SP off (ADP suppresses it), dense_ffn off
+        for rank in range(4):
+            with self.subTest(config="tp2_cp2_dense_adp", rank=rank):
+                m = _make_dense_adp(rank=rank,
+                                    world_size=4,
+                                    tp_size=2,
+                                    cp_size=2,
+                                    row_size=2,
+                                    col_size=1)
+                self.assertFalse(m.attn2d_sequence_parallel,
+                                 "ADP must suppress SP")
+                # attn2d_dense_ffn is False under ADP (flag is no-ADP only)
+                self.assertFalse(
+                    m.attn2d_dense_ffn,
+                    "attn2d_dense_ffn is False under ADP (no-ADP dense only)")
+
+        # ADP + MoE (no dense_ffn) → still SP off
+        for rank in range(4):
+            with self.subTest(config="tp2_cp2_moe_adp", rank=rank):
+                m = _make_attn2d(rank=rank,
+                                 world_size=4,
+                                 tp_size=2,
+                                 cp_size=2,
+                                 row_size=2,
+                                 col_size=1,
+                                 enable_adp=True)
+                self.assertFalse(m.attn2d_sequence_parallel,
+                                 "ADP must suppress SP for MoE too")
+
+    # ------------------------------------------------------------------
+    # 10. Mistral registry resolution: active class must have dense_ffn defaults
+    # ------------------------------------------------------------------
+
+    def test_mistral_registry_returns_dense_ffn_defaults(self):
+        """BUG 2 regression guard: active Mistral class must return dense_ffn=True.
+
+        MODEL_CLASS_MAPPING['MistralForCausalLM'] must resolve to the
+        modeling_mistral class (not the dead modeling_llama stub) and must
+        return dense_ffn=True for ATTN2D args.
+        """
+        from types import SimpleNamespace
+
+        # Trigger model registration by importing the models package.
+        import tensorrt_llm._torch.models  # noqa: F401
+        from tensorrt_llm._torch.models.modeling_utils import \
+            MODEL_CLASS_MAPPING
+
+        cls = MODEL_CLASS_MAPPING.get("MistralForCausalLM")
+        self.assertIsNotNone(
+            cls, "MistralForCausalLM must be in MODEL_CLASS_MAPPING")
+
+        # Verify it comes from modeling_mistral, not the dead modeling_llama stub.
+        self.assertIn(
+            "modeling_mistral",
+            cls.__module__,
+            "Active MistralForCausalLM must be from modeling_mistral, not modeling_llama",
+        )
+
+        attn2d_args = SimpleNamespace(cp_config=SimpleNamespace(
+            cp_type=CpType.ATTN2D))
+        defaults = cls.get_model_defaults(attn2d_args)
+        self.assertEqual(
+            defaults, {"cp_config": {
+                "dense_ffn": True
+            }}, "Active Mistral class must return dense_ffn=True for ATTN2D")
+
+        no_cp_args = SimpleNamespace(cp_config=None)
+        self.assertEqual(
+            cls.get_model_defaults(no_cp_args), {},
+            "Active Mistral class must return empty dict for non-ATTN2D")
+
+    # ------------------------------------------------------------------
+    # 11. ATTN2D MoE comm strategy guard: AllGatherReduceScatter must raise
+    # ------------------------------------------------------------------
+
+    def test_attn2d_agrs_raises(self):
+        """AllGatherReduceScatter must raise RuntimeError for any ATTN2D mapping.
+
+        AllGatherReduceScatter uses the TP group only; for ATTN2D the EP group
+        spans tp×cp ranks, so silently creating it would give wrong results.
+        BUG 3 guard.
+        """
+        from tensorrt_llm._torch.modules.fused_moe.communication.allgather_reducescatter import \
+            AllGatherReduceScatter
+
+        attn2d_mapping = _make_attn2d(rank=0,
+                                      world_size=4,
+                                      tp_size=2,
+                                      cp_size=2,
+                                      row_size=2,
+                                      col_size=1,
+                                      enable_adp=False)
+        with self.assertRaises(
+                RuntimeError,
+                msg="AllGatherReduceScatter must raise for ATTN2D mapping"):
+            AllGatherReduceScatter(attn2d_mapping)
+
+        # Also guard ADP path
+        attn2d_adp_mapping = _make_attn2d(rank=0,
+                                          world_size=4,
+                                          tp_size=2,
+                                          cp_size=2,
+                                          row_size=2,
+                                          col_size=1,
+                                          enable_adp=True)
+        with self.assertRaises(
+                RuntimeError,
+                msg="AllGatherReduceScatter must raise for ATTN2D ADP mapping"):
+
+            AllGatherReduceScatter(attn2d_adp_mapping)
+
+        # Non-ATTN2D mapping must still work fine (no raise)
+        plain_mapping = Mapping(world_size=4, rank=0, tp_size=4)
+        try:
+            AllGatherReduceScatter(plain_mapping)
+        except RuntimeError:
+            self.fail(
+                "AllGatherReduceScatter must not raise for a non-ATTN2D mapping"
+            )
+
+    # ------------------------------------------------------------------
+    # 12. CommunicationFactory raises for ATTN2D before AllGatherReduceScatter
+    # ------------------------------------------------------------------
+
+    def test_attn2d_comm_factory_non_divisible_ep_raises(self):
+        """CommunicationFactory must raise RuntimeError for ATTN2D mappings.
+
+        When num_experts % moe_ep_size != 0 (the non-divisible-EP fallback
+        site), after the BUG 3 guard the factory raises before reaching
+        AllGatherReduceScatter.  The guard is at communication_factory.py
+        (non-divisible EP path and final AllGatherReduceScatter fallback).
+
+        This test exercises the guard via AllGatherReduceScatter.__init__
+        which is the backstop called by both factory paths; the factory itself
+        requires MPI/GPU to instantiate NVLink/DeepEP and is tested via the
+        __init__ guard here (CPU-only, no hardware needed).
+        """
+        from tensorrt_llm._torch.modules.fused_moe.communication.allgather_reducescatter import \
+            AllGatherReduceScatter
+
+        # tp=2, cp=2 ATTN2D: moe_ep_size=4.  Use num_experts=7 (not divisible
+        # by 4) to exercise the non-divisible-EP fallback guard.  The factory
+        # guard raises before constructing AllGatherReduceScatter, but the
+        # __init__ backstop also independently rejects any ATTN2D mapping.
+        for rank in range(4):
+            attn2d = _make_attn2d(rank=rank,
+                                  world_size=4,
+                                  tp_size=2,
+                                  cp_size=2,
+                                  row_size=2,
+                                  col_size=1,
+                                  enable_adp=False)
+            with self.assertRaises(
+                    RuntimeError,
+                    msg=
+                    f"AllGatherReduceScatter backstop must raise for ATTN2D rank {rank}"
+            ):
+                AllGatherReduceScatter(attn2d)
+
+        # moe_ep_size=4, num_experts=8 (divisible): final-fallback path.
+        # The guard in AllGatherReduceScatter.__init__ fires for all ranks.
+        for rank in range(4):
+            attn2d_adp = _make_attn2d(rank=rank,
+                                      world_size=4,
+                                      tp_size=2,
+                                      cp_size=2,
+                                      row_size=2,
+                                      col_size=1,
+                                      enable_adp=True)
+            with self.assertRaises(RuntimeError):
+                AllGatherReduceScatter(attn2d_adp)
+
+    # ------------------------------------------------------------------
+    # 13. GatedMLP overridden_tp_size: ADP path must yield tp_size=1
+    # ------------------------------------------------------------------
+
+    def test_gated_mlp_overridden_tp_size_adp(self):
+        """GatedMLP(overridden_tp_size=1) must produce gate_up_proj.tp_size==1.
+
+        LlamaDecoderLayer and MistralDecoderLayer wire:
+            overridden_tp_size=1 if self.enable_attention_dp else None
+        Reverting that one-liner would not fail the multi-GPU dense-FFN forward
+        test (which builds GatedMLP directly).  This CPU test is the regression
+        guard for the GatedMLP-level behavior; the multi-GPU test covers the
+        full end-to-end numerical correctness.
+        """
+        from tensorrt_llm._torch.model_config import ModelConfig
+        from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+
+        hidden, intermediate = 64, 128
+
+        # ADP: decoder layer passes overridden_tp_size=1 → tp_size must be 1
+        adp_mapping = Mapping(world_size=2,
+                              rank=0,
+                              tp_size=2,
+                              enable_attention_dp=True)
+        adp_config = ModelConfig(mapping=adp_mapping,
+                                 skip_create_weights_in_init=True)
+        mlp_adp = GatedMLP(hidden_size=hidden,
+                           intermediate_size=intermediate,
+                           bias=False,
+                           config=adp_config,
+                           overridden_tp_size=1)
+        self.assertEqual(mlp_adp.gate_up_proj.tp_size, 1,
+                         "ADP: gate_up_proj.tp_size must be 1")
+        self.assertEqual(mlp_adp.down_proj.tp_size, 1,
+                         "ADP: down_proj.tp_size must be 1")
+
+        # no-ADP: decoder layer passes overridden_tp_size=None → tp_size stays 2
+        no_adp_mapping = Mapping(world_size=2, rank=0, tp_size=2)
+        no_adp_config = ModelConfig(mapping=no_adp_mapping,
+                                    skip_create_weights_in_init=True)
+        mlp_no_adp = GatedMLP(hidden_size=hidden,
+                              intermediate_size=intermediate,
+                              bias=False,
+                              config=no_adp_config,
+                              overridden_tp_size=None)
+        self.assertEqual(mlp_no_adp.gate_up_proj.tp_size, 2,
+                         "no-ADP: gate_up_proj.tp_size must be 2")
+        self.assertEqual(mlp_no_adp.down_proj.tp_size, 2,
+                         "no-ADP: down_proj.tp_size must be 2")

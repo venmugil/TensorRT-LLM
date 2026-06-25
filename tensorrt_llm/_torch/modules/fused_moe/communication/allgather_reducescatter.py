@@ -38,6 +38,13 @@ class AllGatherReduceScatter(Communication):
         mapping: Mapping,
     ):
         super().__init__(mapping)
+        if mapping.has_cp_attn2d():
+            raise RuntimeError(
+                "AllGatherReduceScatter cannot be used with ATTN2D CP mode. "
+                "MoE EP collectives must operate over the full tp×cp group, "
+                "but AllGatherReduceScatter only gathers/scatters over the TP group, silently "
+                "dropping the CP token dimension. Use NVLink or DeepEP instead."
+            )
 
         # Initialize dispatch state
         self._dispatch_state = {}

@@ -162,6 +162,13 @@ class CommunicationFactory:
 
         # Non-divisible EP: NVLinkTwoSided and DeepEP require num_experts % ep_size == 0.
         if num_experts % mapping.moe_ep_size != 0:
+            if mapping.has_cp_attn2d():
+                raise RuntimeError(
+                    f"ATTN2D MoE requires num_experts ({num_experts}) to be divisible by "
+                    f"moe_ep_size=tp*cp ({mapping.moe_ep_size}). "
+                    "AllGatherReduceScatter cannot handle the tp×cp EP group; "
+                    "ensure NVLink or DeepEP is available and adjust num_experts or parallelism."
+                )
             logger.info(
                 f"Non-divisible EP (num_experts={num_experts}, ep_size={mapping.moe_ep_size}): "
                 "falling back to AllGatherReduceScatter"
@@ -227,7 +234,14 @@ class CommunicationFactory:
             except Exception as e:
                 logger.info(f"DeepEPLowLatency not available: {e}")
 
-        # Fallback to AllGather + ReduceScatter (always works)
+        # Fallback to AllGather + ReduceScatter (always works, but not for ATTN2D)
+        if mapping.has_cp_attn2d():
+            raise RuntimeError(
+                "ATTN2D MoE requires NVLink or DeepEP communication strategy. "
+                "AllGatherReduceScatter operates only over the TP group and cannot "
+                "handle the full tp×cp expert-parallel group. "
+                "Ensure NVLink or DeepEP is available, or reduce parallelism."
+            )
         strategy = AllGatherReduceScatter(mapping)
         logger.info("Selected communication strategy: AllGatherReduceScatter (fallback)")
         return strategy

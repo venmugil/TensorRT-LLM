@@ -47,7 +47,8 @@ from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             EagerFusionConfig, register_auto_model)
+                             EagerFusionConfig, attn2d_dense_ffn_defaults,
+                             register_auto_model)
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
@@ -691,6 +692,7 @@ class LlamaDecoderLayer(DecoderLayer):
             config=model_config,
             layer_idx=layer_idx,
             use_custom_cublas_mm=use_custom_cublas_mm,
+            overridden_tp_size=1 if self.enable_attention_dp else None,
         )
         differ_pp_stage_with_previous_layer = False
         if self.mapping.has_pp():
@@ -1131,14 +1133,6 @@ class LlamaModel(DecoderModel):
         return hidden_states
 
 
-def _attn2d_dense_ffn_defaults(llm_args) -> dict:
-    from tensorrt_llm.llmapi.llm_args import CpType
-    if (llm_args.cp_config is not None
-            and llm_args.cp_config.cp_type == CpType.ATTN2D):
-        return {"cp_config": {"dense_ffn": True}}
-    return {}
-
-
 @register_auto_model("LlamaForCausalLM")
 class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
 
@@ -1147,7 +1141,7 @@ class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
         """Mark the mapping dense_ffn under ATTN2D so the MoE-specific
         sequence-parallel o_proj reduce-scatter is suppressed; the FFN
         runs as standard tp-way TP GatedMLP on each rank's CP token shard."""
-        return _attn2d_dense_ffn_defaults(llm_args)
+        return attn2d_dense_ffn_defaults(llm_args)
 
     def __init__(
         self,
@@ -1623,13 +1617,6 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
 
 @register_auto_model("MistralForCausalLM")
 class MistralForCausalLM(DecoderModelForCausalLM[LlamaModel, LlamaConfig]):
-
-    @classmethod
-    def get_model_defaults(cls, llm_args) -> dict:
-        """Mark the mapping dense_ffn under ATTN2D so the MoE-specific
-        sequence-parallel o_proj reduce-scatter is suppressed; the FFN
-        runs as standard tp-way TP GatedMLP on each rank's CP token shard."""
-        return _attn2d_dense_ffn_defaults(llm_args)
 
     def __init__(
         self,
