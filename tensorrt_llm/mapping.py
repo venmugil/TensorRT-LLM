@@ -417,14 +417,31 @@ class MappingBase:
     def attn2d_sequence_parallel(self) -> bool:
         """True when ATTN2D sequence-parallel (SP) mode is active.
 
-        SP is active when ATTN2D is enabled, attention-DP is off, and tp>1.
+        SP is active when ATTN2D is enabled, attention-DP is off, tp>1, and
+        the model uses a MoE FFN (not a dense FFN).  Dense models set
+        ``cp_config["dense_ffn"]=True`` (via ``get_model_defaults``) to opt
+        out: they run a standard tp-way TP FFN on the CP-sharded tokens
+        instead and do not need the o_proj reduce-scatter.
+
         In this mode, the o_proj all-reduce is replaced by a reduce-scatter
-        over the TP group (via ``mapping_o``), sharding tokens across TP peers.
-        Combined with CP's token sharding, all tp×cp ranks then hold distinct
-        tokens, enabling moe_ep=tp×cp without DP-replicated experts.
+        over the TP group (via ``mapping_o``), sharding tokens across TP
+        peers.  Combined with CP's token sharding, all tp×cp ranks then hold
+        distinct tokens, enabling moe_ep=tp×cp without DP-replicated experts.
         """
         return (self.has_cp_attn2d() and not self.enable_attention_dp
-                and self.tp_size > 1)
+                and self.tp_size > 1 and not self.cp_config.get("dense_ffn"))
+
+    @property
+    def attn2d_dense_ffn(self) -> bool:
+        """True when ATTN2D is running with a dense (non-MoE) FFN.
+
+        Dense ATTN2D keeps CP as the sequence/context dimension and runs a
+        standard tp-way TP GatedMLP on each rank's CP token shard.  There is
+        no o_proj reduce-scatter (``attn2d_sequence_parallel`` is False).
+        Set automatically via ``CpConfig.dense_ffn`` in ``get_model_defaults``.
+        """
+        return (self.has_cp_attn2d() and not self.enable_attention_dp
+                and bool(self.cp_config.get("dense_ffn")))
 
     @property
     def attn2d_row_size(self) -> int:

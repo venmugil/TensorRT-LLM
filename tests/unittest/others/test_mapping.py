@@ -687,3 +687,70 @@ class TestAttn2dMoeMapping(unittest.TestCase):
                                  col_size=2,
                                  enable_adp=True)
                 self.assertFalse(m.attn2d_sequence_parallel)
+
+    # ------------------------------------------------------------------
+    # 8. dense_ffn flag: attn2d_sequence_parallel off, attn2d_dense_ffn on
+    # ------------------------------------------------------------------
+
+    def test_attn2d_dense_ffn_flag(self):
+        """cp_config["dense_ffn"]=True suppresses SP and activates attn2d_dense_ffn.
+
+        Dense (non-MoE) models set this flag via get_model_defaults so the
+        o_proj runs a standard TP all-reduce instead of a reduce-scatter.
+        The FFN runs as a tp-way TP GatedMLP on the CP token shard.
+        """
+
+        def _make_dense(rank, world_size, tp_size, cp_size, row_size, col_size):
+            return Mapping(
+                world_size=world_size,
+                rank=rank,
+                tp_size=tp_size,
+                cp_size=cp_size,
+                cp_config={
+                    "cp_type": CpType.ATTN2D,
+                    "row_size": row_size,
+                    "col_size": col_size,
+                    "dense_ffn": True,
+                },
+            )
+
+        # tp=2, cp=2, no ADP, dense_ffn → SP suppressed, dense_ffn active
+        for rank in range(4):
+            with self.subTest(config="tp2_cp2_dense", rank=rank):
+                m = _make_dense(rank=rank,
+                                world_size=4,
+                                tp_size=2,
+                                cp_size=2,
+                                row_size=2,
+                                col_size=1)
+                self.assertFalse(m.attn2d_sequence_parallel,
+                                 "dense_ffn must suppress SP")
+                self.assertTrue(m.attn2d_dense_ffn,
+                                "attn2d_dense_ffn must be True")
+
+        # tp=1, cp=4, no ADP, dense_ffn → SP already off (tp=1), dense_ffn active
+        for rank in range(4):
+            with self.subTest(config="tp1_cp4_dense", rank=rank):
+                m = _make_dense(rank=rank,
+                                world_size=4,
+                                tp_size=1,
+                                cp_size=4,
+                                row_size=2,
+                                col_size=2)
+                self.assertFalse(m.attn2d_sequence_parallel)
+                self.assertTrue(m.attn2d_dense_ffn)
+
+        # MoE mapping (no dense_ffn) must be unchanged: SP still active for tp>1
+        for rank in range(4):
+            with self.subTest(config="moe_unaffected", rank=rank):
+                m = _make_attn2d(rank=rank,
+                                 world_size=4,
+                                 tp_size=2,
+                                 cp_size=2,
+                                 row_size=2,
+                                 col_size=1,
+                                 enable_adp=False)
+                self.assertTrue(m.attn2d_sequence_parallel,
+                                "MoE SP must be unaffected by dense_ffn flag")
+                self.assertFalse(m.attn2d_dense_ffn,
+                                 "attn2d_dense_ffn must be False for MoE")

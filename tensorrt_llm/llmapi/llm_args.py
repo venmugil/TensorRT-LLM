@@ -1456,6 +1456,14 @@ class CpConfig(StrictBaseModel):
         default=None,
         description=
         "Col dimension of the ATTN2D mesh (C). R*C must equal cp_size.")
+    dense_ffn: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Internal flag: set automatically for dense (non-MoE) models "
+            "using ATTN2D parallelism.  Disables the MoE-specific "
+            "sequence-parallel o_proj reduce-scatter so the FFN runs as a "
+            "standard tp-way tensor-parallel layer on the CP-sharded tokens. "
+            "Do not set this field manually."))
 
     @field_validator("cp_type", mode="before")
     @classmethod

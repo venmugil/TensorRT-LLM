@@ -271,6 +271,21 @@ class Qwen3Model(DecoderModel):
 @register_auto_model("Qwen3ForCausalLM")
 class Qwen3ForCausalLM(SpecDecOneEngineForCausalLM[Qwen3Model, Qwen3Config]):
 
+    @classmethod
+    def get_model_defaults(cls, llm_args) -> dict:
+        """Apply dense-FFN ATTN2D defaults.
+
+        When this dense model runs under ATTN2D parallelism, mark the mapping
+        as ``dense_ffn=True`` so the MoE-specific sequence-parallel o_proj
+        reduce-scatter is suppressed.  The FFN then runs as a standard tp-way
+        TP GatedMLP on each rank's CP token shard with a plain TP all-reduce.
+        """
+        from tensorrt_llm.llmapi.llm_args import CpType
+        if (llm_args.cp_config is not None
+                and llm_args.cp_config.cp_type == CpType.ATTN2D):
+            return {"cp_config": {"dense_ffn": True}}
+        return {}
+
     def __init__(
         self,
         model_config: ModelConfig[Qwen3Config],
