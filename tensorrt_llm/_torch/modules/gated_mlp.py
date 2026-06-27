@@ -53,8 +53,10 @@ class GatedMLP(nn.Module):
         if overridden_tp_size is not None:
             assert config.mapping.tp_size % overridden_tp_size == 0
             tp_size = overridden_tp_size
-            # "Misuse" pp_size here to perform all-reduce within smaller groups
-            pp_size = config.mapping.pp_size * config.mapping.tp_size // overridden_tp_size
+            # "Misuse" pp_size here to perform all-reduce within smaller groups.
+            # Include cp_size so world_size covers all ranks (needed when cp>1, e.g. ATTN2D ADP).
+            pp_size = (config.mapping.pp_size * config.mapping.tp_size *
+                       config.mapping.cp_size // overridden_tp_size)
             mapping = Mapping(
                 world_size=tp_size * pp_size,
                 rank=self.mapping.rank,

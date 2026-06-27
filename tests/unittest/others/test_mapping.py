@@ -986,7 +986,8 @@ class TestAttn2dMoeMapping(unittest.TestCase):
                            intermediate_size=intermediate,
                            bias=False,
                            config=adp_config,
-                           overridden_tp_size=1)
+                           overridden_tp_size=1,
+                           reduce_output=False)
         self.assertEqual(mlp_adp.gate_up_proj.tp_size, 1,
                          "ADP: gate_up_proj.tp_size must be 1")
         self.assertEqual(mlp_adp.down_proj.tp_size, 1,
@@ -1000,8 +1001,31 @@ class TestAttn2dMoeMapping(unittest.TestCase):
                               intermediate_size=intermediate,
                               bias=False,
                               config=no_adp_config,
-                              overridden_tp_size=None)
+                              overridden_tp_size=None,
+                              reduce_output=False)
         self.assertEqual(mlp_no_adp.gate_up_proj.tp_size, 2,
                          "no-ADP: gate_up_proj.tp_size must be 2")
         self.assertEqual(mlp_no_adp.down_proj.tp_size, 2,
                          "no-ADP: down_proj.tp_size must be 2")
+
+        # ATTN2D cp=2 ADP: rank in upper cp-slice (rank 2) with overridden_tp_size=1.
+        # Before fix A, the override mapping has world_size=2 but rank=2 >= 2 → ValueError.
+        # After fix A, cp_size is folded in: world_size=4, rank=2 is valid → tp_size==1.
+        attn2d_mapping = Mapping(world_size=4,
+                                 rank=2,
+                                 tp_size=2,
+                                 cp_size=2,
+                                 enable_attention_dp=True)
+        attn2d_config = ModelConfig(mapping=attn2d_mapping,
+                                    skip_create_weights_in_init=True)
+        mlp_attn2d = GatedMLP(hidden_size=hidden,
+                              intermediate_size=intermediate,
+                              bias=False,
+                              config=attn2d_config,
+                              overridden_tp_size=1,
+                              reduce_output=False)
+        self.assertEqual(
+            mlp_attn2d.gate_up_proj.tp_size, 1,
+            "ATTN2D ADP cp=2 rank=2: gate_up_proj.tp_size must be 1")
+        self.assertEqual(mlp_attn2d.down_proj.tp_size, 1,
+                         "ATTN2D ADP cp=2 rank=2: down_proj.tp_size must be 1")
