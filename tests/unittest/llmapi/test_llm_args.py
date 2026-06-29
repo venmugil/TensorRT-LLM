@@ -393,6 +393,31 @@ class TestModelDefaults:
         error_str = str(exc_info.value)
         assert "enable_block_reuse" in error_str or "max_tokens" in error_str
 
+    def test_model_defaults_cp_config_reaches_mapping(self):
+        # BUG F regression: apply_model_defaults_to_llm_args copied model_fields
+        # but not PrivateAttr fields (_parallel_config), so cp_config.dense_ffn
+        # merged by model defaults was dropped from to_mapping() -> attn2d_sequence_parallel
+        # stayed True -> o_proj reduce-scatter -> token-count mismatch at fused RMSNorm.
+        llm_args = TorchLlmArgs(model="/tmp/dummy",
+                                tensor_parallel_size=2,
+                                context_parallel_size=4,
+                                cp_config={
+                                    "cp_type": "ATTN2D",
+                                    "row_size": 2,
+                                    "col_size": 2
+                                })
+        # Pre-merge: dense_ffn absent -> SP is on (no-ADP, tp>1, has_cp_attn2d, no dense_ffn)
+        assert llm_args.parallel_config.to_mapping(
+        ).attn2d_sequence_parallel is True
+        apply_model_defaults_to_llm_args(llm_args,
+                                         {"cp_config": {
+                                             "dense_ffn": True
+                                         }})
+        m = llm_args.parallel_config.to_mapping()
+        assert m.cp_config.get("dense_ffn") is True
+        assert m.attn2d_dense_ffn is True
+        assert m.attn2d_sequence_parallel is False
+
 
 def test_KvCacheConfig_declaration():
     assert KvCacheConfig().kv_cache_event_hash_algo == "auto"

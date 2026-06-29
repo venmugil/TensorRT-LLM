@@ -521,6 +521,14 @@ def apply_model_defaults_to_llm_args(
 
     for field_name in llm_args.model_fields:
         setattr(llm_args, field_name, getattr(new_args, field_name))
+    # _parallel_config (and any other PrivateAttr built by after-validators from
+    # parallel fields incl. cp_config) is not a model field, so the loop above
+    # leaves the stale pre-merge instance in place.  With validate_assignment off
+    # the setattr loop doesn't rebuild it either.  Sync from new_args so
+    # to_mapping() and the runtime Mapping reflect merged defaults (e.g.
+    # cp_config.dense_ffn for ATTN2D dense models).
+    if new_args.__pydantic_private__:
+        llm_args.__pydantic_private__.update(new_args.__pydantic_private__)
 
     def _compute_applied(defaults: Dict[str, Any],
                          overrides: Dict[str, Any]) -> Dict[str, Any]:
