@@ -424,6 +424,16 @@ class ConfigurableMoE(MoE):
         When using DP communication, the dispatch (AllGather/AllToAll) collects
         tokens from all DP ranks, so total tokens = num_dp_ranks * max_tokens_per_rank.
         """
+        # ATTN2D drives an AllToAll (DeepEP) exchange over the full tp×cp expert
+        # group: each rank only materializes the tokens routed to its local
+        # experts (bounded by max(all_rank_num_tokens)), not the gathered
+        # len×max set, so the AllGather-style row count over-counts by cp.
+        # DeepEP also has no chunked dispatch (num_chunks>1 is infeasible) and
+        # the only fallback (AllGatherReduceScatter) is banned for ATTN2D, so the
+        # MoE must run in a single chunk. Per-forward memory is bounded by
+        # max_num_tokens (the prefill chunk size), not by MoE chunking.
+        if self.mapping.has_cp_attn2d():
+            return 1
         if self.use_dp and self.comm is not None:
             num_rows = self._dp_padded_num_rows(all_rank_num_tokens)
         else:
@@ -481,6 +491,18 @@ class ConfigurableMoE(MoE):
 
         if not feasible_workload:
             all_rank_max_num_tokens = max(all_rank_num_tokens)
+            if self.mapping.has_cp_attn2d():
+                # AllGatherReduceScatter is banned for ATTN2D (it can't operate
+                # over the tp×cp EP group), so there is no valid fallback. Fail
+                # with an actionable message instead of constructing a comm that
+                # raises mid-request.
+                raise RuntimeError(
+                    f"MoE comm strategy {self.comm.__class__.__name__} is "
+                    f"infeasible for this ATTN2D workload (num_chunks={num_chunks}, "
+                    f"max_num_tokens={all_rank_max_num_tokens}) and ATTN2D has no "
+                    f"valid fallback. Lower max_num_tokens, and ensure bf16 weights "
+                    f"so DeepEP is usable."
+                )
             logger.info(
                 f"Communication strategy {self.comm.__class__.__name__} "
                 f"cannot be used (num_chunks={num_chunks}, max_num_tokens={all_rank_max_num_tokens}). "

@@ -2885,10 +2885,10 @@ class PyTorchModelEngine(ModelEngine):
         # Handle padding for piecewise CUDA graphs
         attn_metadata.padded_num_tokens = None
 
-        # Handle attention DP
-        if enable_attention_dp:
-            attn_metadata.all_rank_num_tokens = self._get_all_rank_num_tokens(
-                attn_metadata)
+        # Handle attention DP / ATTN2D-SP
+        attn_all_rank_num_tokens = self._get_all_rank_num_tokens(attn_metadata)
+        if attn_all_rank_num_tokens is not None:
+            attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
 
         # Prepare speculative metadata
         if spec_metadata is not None:
@@ -4301,7 +4301,7 @@ class PyTorchModelEngine(ModelEngine):
                                                             virtual_num_tokens].unsqueeze(
                                                                 0)
 
-        if self.enable_attention_dp:
+        if attn_all_rank_num_tokens is not None:
             attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
 
         # Prepare inputs
@@ -4508,7 +4508,7 @@ class PyTorchModelEngine(ModelEngine):
         set_per_request_piecewise_cuda_graph_flag(can_run_piecewise_cuda_graph)
         attn_metadata.padded_num_tokens = padded_num_tokens if padded_num_tokens != num_tokens else None
 
-        if self.enable_attention_dp:
+        if attn_all_rank_num_tokens is not None:
             attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
 
         virtual_num_tokens = num_tokens

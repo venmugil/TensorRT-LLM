@@ -436,6 +436,7 @@ class DecoderModelForCausalLM(nn.Module,
                 use_custom_cublas_mm=getattr(model, 'use_custom_cublas_mm',
                                              False),
                 quant_config=lm_head_quant_config,
+                allreduce_strategy=config.allreduce_strategy,
             )
 
             if self.has_custom_lm_head:
