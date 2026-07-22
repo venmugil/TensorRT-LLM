@@ -49,8 +49,8 @@ from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..utils import is_torch_compiling, maybe_compiled_cat, maybe_compiled_copy_
 from .attention import (
-    _helix_cp_allgather_input,
-    _helix_cp_output_projection,
+    _cp_sp_allgather_input,
+    _cp_sp_output_projection,
     _helix_post_process,
     _helix_zero_kv_mask,
     extract_extra_attrs,
@@ -437,8 +437,9 @@ class MLA(nn.Module):
         if self.mapping.has_cp_ulysses():
             raise NotImplementedError("MLA doesn't support CP Ulysses yet")
         if self.mapping.cp_size > 1:
-            assert self.mapping.has_cp_helix(), (
-                f"CP type must be HELIX for MLA, but got {self.mapping.cp_config['cp_type']}."
+            assert self.mapping.has_cp_helix() or self.mapping.has_cp_attn2d(), (
+                f"CP type must be HELIX or ATTN2D for MLA, but got "
+                f"{self.mapping.cp_config['cp_type']}."
             )
 
         mapping = Mapping(
@@ -452,9 +453,12 @@ class MLA(nn.Module):
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
 
-        assert self.num_heads % (tp_size * cp_size) == 0
+        # HELIX shards query heads across CP ranks; ATTN2D distributes tokens
+        # instead, so every CP rank keeps all of its TP-local heads.
+        head_cp_size = cp_size if self.mapping.has_cp_helix() else 1
+        assert self.num_heads % (tp_size * head_cp_size) == 0
         self.num_heads_tp = self.num_heads // tp_size
-        self.num_heads_tp_cp = self.num_heads_tp // cp_size
+        self.num_heads_tp_cp = self.num_heads_tp // head_cp_size
         self.num_key_value_heads_tp = (self.num_key_value_heads + tp_size - 1) // tp_size
         if self.is_deepseek_v4:
             if self.num_groups % tp_size != 0:
@@ -576,15 +580,35 @@ class MLA(nn.Module):
                 requires_grad=False,
             )
 
-        mapping_o = Mapping(
-            world_size=pp_size * dp_size * tp_size * cp_size,
-            tp_size=tp_size * cp_size,
-            pp_size=pp_size * dp_size,
-            cp_size=1,
-            rank=self.mapping.rank,
-            gpus_per_node=self.mapping.gpus_per_node,
-            enable_attention_dp=self.mapping.enable_attention_dp,
-        )
+        # o_proj is row-parallel over the head dimension.  HELIX folds CP into
+        # the reduction group (heads are sharded over TP∪CP), so o_proj reduces
+        # across tp_size*cp_size ranks.  ATTN2D keeps all heads local to each CP
+        # rank (tokens are sharded, not heads), so o_proj reduces over TP only --
+        # but the TP peers are stride-cp_size apart in the global rank ordering,
+        # so cp_size must stay in the mapping for the TP groups to be built
+        # correctly.  Mirrors modules/attention.py.
+        if self.mapping.has_cp_attn2d() and tp_size > 1:
+            mapping_o = Mapping(
+                world_size=pp_size * dp_size * tp_size * cp_size,
+                tp_size=tp_size,
+                pp_size=pp_size * dp_size,
+                cp_size=cp_size,
+                cp_config=self.mapping.cp_config,
+                rank=self.mapping.rank,
+                gpus_per_node=self.mapping.gpus_per_node,
+                enable_attention_dp=self.mapping.enable_attention_dp,
+            )
+        else:
+            o_proj_tp_size = tp_size * (cp_size if self.mapping.has_cp_helix() else 1)
+            mapping_o = Mapping(
+                world_size=pp_size * dp_size * tp_size * cp_size,
+                tp_size=o_proj_tp_size,
+                pp_size=pp_size * dp_size,
+                cp_size=1,
+                rank=self.mapping.rank,
+                gpus_per_node=self.mapping.gpus_per_node,
+                enable_attention_dp=self.mapping.enable_attention_dp,
+            )
         self.mapping_o = mapping_o
         if self.is_deepseek_v4:
             self.o_a_proj = nn.Parameter(
@@ -657,8 +681,14 @@ class MLA(nn.Module):
             self.indexer_aux_stream if self.indexer_aux_stream is not None else aux_stream
         )
 
+        # ATTN2D distributes context tokens across the CP mesh inside the
+        # attention backend; the absorbed (MQA-over-latent) path routes through
+        # it, so override the configured backend for the latent attention.
+        mqa_backend = config.attn_backend
+        if self.mapping.has_cp_attn2d():
+            mqa_backend = "ATTN2D"
         self.mqa = create_attention(
-            config.attn_backend,
+            mqa_backend,
             self.layer_idx,
             self.num_heads_tp,
             head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
@@ -2259,6 +2289,19 @@ class MLA(nn.Module):
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.mapping.has_cp_attn2d():
+            # ATTN2D routes context through the absorbed (MQA-over-latent) path:
+            # the ATTN2D backend gathers the compressed latent across the CP mesh
+            # and handles chunked prefill internally via its paged latent cache.
+            return self.forward_absorption_context(
+                q,
+                compressed_kv,
+                k_pe,
+                attn_metadata,
+                output,
+                position_ids=position_ids,
+                latent_cache=latent_cache,
+            )
         if isinstance(attn_metadata, FlashInferAttentionMetadata):
             if (
                 attn_metadata.enable_context_mla_with_cached_kv
@@ -2873,8 +2916,8 @@ class MLA(nn.Module):
         all_reduce_params: Optional[AllReduceParams] = None,
         latent_cache_gen: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        hidden_states = _helix_cp_allgather_input(
-            hidden_states, attn_metadata, self.mapping, self.layer_idx
+        hidden_states = _cp_sp_allgather_input(
+            hidden_states, attn_metadata, self.mapping, self.layer_idx, self.mapping_o
         )
 
         dsv4_epilogue_output: Optional[tuple[torch.Tensor, torch.Tensor]] = None
@@ -2972,7 +3015,7 @@ class MLA(nn.Module):
             else:
                 attn_output = self._deepseek_v4_o_proj(attn_output, position_ids)
         else:
-            attn_output = _helix_cp_output_projection(
+            attn_output = _cp_sp_output_projection(
                 self.o_proj,
                 attn_output,
                 attn_metadata,

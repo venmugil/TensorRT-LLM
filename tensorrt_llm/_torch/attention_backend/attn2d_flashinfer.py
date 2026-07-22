@@ -76,6 +76,7 @@ at exit.  The total length is read from ``metadata.total_input_lens``;
 if absent the backend assumes divisibility.
 """
 
+import math
 from dataclasses import dataclass, field
 from itertools import accumulate
 from typing import List, Optional, Tuple
@@ -98,6 +99,7 @@ from .interface import (
     PredefinedAttentionMask,
     merge_attention_forward_args,
 )
+from .utils import append_mla_latent_cache
 
 
 @dataclass(kw_only=True)
@@ -441,6 +443,10 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
 
     Metadata = Attn2DFlashInferAttentionMetadata
 
+    @classmethod
+    def support_mla(cls) -> bool:
+        return True
+
     def __init__(
         self,
         layer_idx: int,
@@ -463,6 +469,25 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
             None
         )
 
+        # MLA (absorbed / MQA-over-latent) support.  When ``mla_params`` is set,
+        # ``q`` is the fused query of width ``head_dim = kv_lora_rank +
+        # qk_rope_head_dim`` (the query/key latent width), the K/V for the new
+        # tokens is the single compressed-latent head ``[compressed_kv | k_pe]``
+        # delivered via ``forward_args.latent_cache``, and V is the leading
+        # ``v_head_dim_out`` slice of that latent (no separate V collective).
+        mla_params = kwargs.get("mla_params", None)
+        self.is_mla = mla_params is not None
+        self.mla_sm_scale: Optional[float] = None
+        # Value/output head dim: kv_lora_rank for standard MLA (v_head_dim for
+        # DeepSeek-V4); equals head_dim for the non-MLA MHA/GQA path.
+        self.v_head_dim_out = head_dim
+        if self.is_mla:
+            q_scaling = kwargs.get("q_scaling", None) or 1.0
+            qk_head_dim = mla_params.qk_nope_head_dim + mla_params.qk_rope_head_dim
+            self.v_head_dim_out = mla_params.v_head_dim
+            # MLA scales by the un-absorbed qk head dim, NOT the latent width.
+            self.mla_sm_scale = 1.0 / (math.sqrt(qk_head_dim) * q_scaling)
+
     def forward(
         self,
         q: torch.Tensor,
@@ -479,7 +504,19 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
                 f"Attn2DFlashInferAttention only supports CAUSAL mask, got "
                 f"{forward_args.attention_mask}."
             )
-        if k is None or v is None:
+
+        is_mla = self.is_mla
+        latent_new: Optional[torch.Tensor] = None
+        if is_mla:
+            # Absorbed MLA: ``q`` is the fused query; the new tokens' K/V is the
+            # single compressed-latent head in ``forward_args.latent_cache``.
+            latent_new = forward_args.latent_cache
+            if latent_new is None:
+                raise ValueError(
+                    "Attn2DFlashInferAttention MLA path requires "
+                    "forward_args.latent_cache to hold the new-token latent."
+                )
+        elif k is None or v is None:
             raise NotImplementedError(
                 "Attn2DFlashInferAttention requires separate K and V inputs "
                 "(fused QKV not supported in v0)."
@@ -503,14 +540,24 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
 
         H_q = self.num_heads
         H_kv = self.num_kv_heads
-        D = self.head_dim
+        D = self.head_dim  # query/key head dim (latent width for MLA)
+        # Value/output head dim: differs from D only for MLA (V is the leading
+        # kv_lora_rank slice of the D-wide latent).
+        D_vo = self.v_head_dim_out if is_mla else D
+        sm_scale = self.mla_sm_scale if is_mla else None
 
         q = q.view(-1, H_q, D)
-        k = k.view(-1, H_kv, D)
-        v = v.view(-1, H_kv, D)
+        if is_mla:
+            latent_new = latent_new.view(-1, H_kv, D)
+        else:
+            k = k.view(-1, H_kv, D)
+            v = v.view(-1, H_kv, D)
 
         if metadata.kv_cache_manager is not None:
-            self._append_new_kv_to_cache(k, v, metadata)
+            if is_mla:
+                self._append_new_latent_to_cache(latent_new, metadata)
+            else:
+                self._append_new_kv_to_cache(k, v, metadata)
 
         seq_lens = metadata.seq_lens.tolist()
         assert metadata.total_input_lens is not None, (
@@ -581,7 +628,18 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
         for req_idx in range(B):
             local_new_len = local_new_len_all[req_idx]
             L_local_total = L_local_total_all[req_idx]
-            if has_cache:
+            if is_mla:
+                # K = full latent [., H_kv, D]; V = leading D_vo slice of it.
+                if has_cache:
+                    latent_req = self._materialize_latent_from_pages(
+                        metadata, req_idx, L_local_total
+                    )
+                else:
+                    latent_req = latent_new[kv_offset : kv_offset + local_new_len]
+                    kv_offset += local_new_len
+                k_req = latent_req
+                v_req = latent_req[..., :D_vo]
+            elif has_cache:
                 k_req, v_req = self._materialize_kv_from_pages(metadata, req_idx, L_local_total)
             else:
                 k_req = k[kv_offset : kv_offset + local_new_len]
@@ -622,18 +680,36 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
         # 2-3) ONE batched redistribute + col-gather K/V.                     #
         # ------------------------------------------------------------------ #
         if R > 1:
-            kv_send = torch.stack([k_cat, v_cat], dim=1).contiguous()
-            kv_redistributed = _redistribute_kv_to_row_major(
-                kv_send,
-                R=R,
-                C=C,
-                cp_rank=cp_rank,
-                cp_group=mapping.cp_group,
-                recv_count=recv_count_batch,
-            )
-            kv_recv = attn2d_col_allgather(kv_redistributed, mapping, dim=0, sizes=sizes_col_batch)
-            k_col_batch = kv_recv[:, 0].contiguous()
-            v_col_batch = kv_recv[:, 1].contiguous()
+            if is_mla:
+                # Only the latent K travels the mesh; V is a slice of it, so we
+                # skip the fused stack([k, v]) collective entirely.
+                latent_redistributed = _redistribute_kv_to_row_major(
+                    k_cat.contiguous(),
+                    R=R,
+                    C=C,
+                    cp_rank=cp_rank,
+                    cp_group=mapping.cp_group,
+                    recv_count=recv_count_batch,
+                )
+                k_col_batch = attn2d_col_allgather(
+                    latent_redistributed, mapping, dim=0, sizes=sizes_col_batch
+                )
+                v_col_batch = k_col_batch[..., :D_vo].contiguous()
+            else:
+                kv_send = torch.stack([k_cat, v_cat], dim=1).contiguous()
+                kv_redistributed = _redistribute_kv_to_row_major(
+                    kv_send,
+                    R=R,
+                    C=C,
+                    cp_rank=cp_rank,
+                    cp_group=mapping.cp_group,
+                    recv_count=recv_count_batch,
+                )
+                kv_recv = attn2d_col_allgather(
+                    kv_redistributed, mapping, dim=0, sizes=sizes_col_batch
+                )
+                k_col_batch = kv_recv[:, 0].contiguous()
+                v_col_batch = kv_recv[:, 1].contiguous()
         else:
             k_col_batch = k_cat
             v_col_batch = v_cat
@@ -726,6 +802,8 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
             L_total_list=total_lens,
             H_q=H_q,
             D=D,
+            D_vo=D_vo,
+            sm_scale=sm_scale,
             R=R,
             C=C,
             row_idx=row_idx,
@@ -744,7 +822,7 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
         for i in range(B):
             L_q_i = L_q_per_row_all[i]
             if L_q_i > 0:
-                output_i = sorted_q_list[i].new_empty(L_q_i, H_q, D)
+                output_i = sorted_q_list[i].new_empty(L_q_i, H_q, D_vo)
                 lse_i = sorted_q_list[i].new_empty(L_q_i, H_q, dtype=torch.float32)
                 output_i[q_sort_idx_list[i]] = output_sorted_list[i]
                 lse_i[q_sort_idx_list[i]] = lse_sorted_list[i]
@@ -767,7 +845,7 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
             total_max_sz = sum(max_sz_all)
 
             if total_max_sz == 0:
-                return q.new_zeros(sum(local_new_len_all), H_q * D)
+                return q.new_zeros(sum(local_new_len_all), H_q * D_vo)
 
             o_chunks: List[torch.Tensor] = []
             lse_chunks: List[torch.Tensor] = []
@@ -784,7 +862,7 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
                     lse_ci = lse_all[i][start_i : start_i + sz_i]
                     if sz_i < max_sz_i:
                         pad = max_sz_i - sz_i
-                        o_ci = torch.cat([o_ci, o_ci.new_zeros(pad, H_q, D)], dim=0)
+                        o_ci = torch.cat([o_ci, o_ci.new_zeros(pad, H_q, D_vo)], dim=0)
                         lse_ci = torch.cat(
                             [lse_ci, lse_ci.new_full((pad, H_q), float("-inf"))], dim=0
                         )
@@ -810,10 +888,10 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
                 out_merged_i, _ = flashinfer.merge_states(v_stack_i, s_stack_i)
                 outputs_final.append(out_merged_i)
 
-            return torch.cat(outputs_final, dim=0).reshape(-1, H_q * D)
+            return torch.cat(outputs_final, dim=0).reshape(-1, H_q * D_vo)
 
         # C == 1: tokens are already complete per request, just cat.
-        return torch.cat(output_all, dim=0).reshape(-1, H_q * D)
+        return torch.cat(output_all, dim=0).reshape(-1, H_q * D_vo)
 
     def _get_ragged_prefill_wrapper(
         self,
@@ -846,6 +924,8 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
         row_idx: int,
         col_idx: int,
         device: torch.device,
+        D_vo: Optional[int] = None,
+        sm_scale: Optional[float] = None,
     ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """Batched Q/K-split FlashInfer attention over B requests.
 
@@ -853,13 +933,21 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
         s ``BatchPrefillWithRaggedKVCacheWrapper`` calls by grouping all B
         requests into one ragged batch per split shard (one round per u/t).
 
+        ``D`` is the query/key head dim; ``D_vo`` is the value/output head dim
+        (defaults to ``D``; differs only for absorbed MLA where the value is the
+        leading ``kv_lora_rank`` slice of the ``D``-wide latent).  ``sm_scale``
+        overrides FlashInfer's default ``1/sqrt(D)`` (required for MLA, which
+        scales by the un-absorbed qk head dim).
+
         Returns ``(output_sorted_list, lse_sorted_list)`` each of length B.
-        ``output_sorted_list[i]`` has shape ``(L_q_list[i], H_q, D)`` and
+        ``output_sorted_list[i]`` has shape ``(L_q_list[i], H_q, D_vo)`` and
         ``lse_sorted_list[i]`` has shape ``(L_q_list[i], H_q)``, both in
         absolute-position sorted order.
         """
         B = len(sorted_q_list)
         H_kv = self.num_kv_heads
+        if D_vo is None:
+            D_vo = D
 
         # Pre-allocate per-request output tensors.
         output_sorted_list: List[torch.Tensor] = []
@@ -867,12 +955,12 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
         for i in range(B):
             L_q_i = L_q_list[i]
             if L_q_i == 0 or L_k_list[i] == 0:
-                output_sorted_list.append(sorted_q_list[i].new_zeros(L_q_i, H_q, D))
+                output_sorted_list.append(sorted_q_list[i].new_zeros(L_q_i, H_q, D_vo))
                 lse_sorted_list.append(
                     sorted_q_list[i].new_full((L_q_i, H_q), float("-inf"), dtype=torch.float32)
                 )
             else:
-                output_sorted_list.append(sorted_q_list[i].new_empty(L_q_i, H_q, D))
+                output_sorted_list.append(sorted_q_list[i].new_empty(L_q_i, H_q, D_vo))
                 lse_sorted_list.append(sorted_q_list[i].new_empty(L_q_i, H_q, dtype=torch.float32))
 
         wrapper = self._get_ragged_prefill_wrapper(device)
@@ -939,7 +1027,9 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
                     H_q,
                     H_kv,
                     D,
+                    head_dim_vo=D_vo,
                     causal=True,
+                    sm_scale=sm_scale,
                     q_data_type=q_cat.dtype,
                     kv_data_type=k_cat.dtype,
                 )
@@ -962,7 +1052,7 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
             # After all rounds, LSE-merge the s partial results per request.
             s = R // C
             v_stacks: List[Optional[torch.Tensor]] = [
-                sorted_q_list[i].new_empty(L_q_list[i], s, H_q, D)
+                sorted_q_list[i].new_empty(L_q_list[i], s, H_q, D_vo)
                 if L_q_list[i] > 0 and L_k_list[i] > 0
                 else None
                 for i in range(B)
@@ -1035,7 +1125,9 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
                     H_q,
                     H_kv,
                     D,
+                    head_dim_vo=D_vo,
                     causal=True,
+                    sm_scale=sm_scale,
                     q_data_type=q_cat.dtype,
                     kv_data_type=k_cat.dtype,
                 )
@@ -1183,6 +1275,72 @@ class Attn2DFlashInferAttention(AttentionBackend[Attn2DFlashInferAttentionMetada
             kv_last_page_len=metadata.paged_kv_last_page_len[:n],
             kv_layout="NHD",
         )
+
+    def _append_new_latent_to_cache(
+        self,
+        latent: torch.Tensor,
+        metadata: Attn2DFlashInferAttentionMetadata,
+    ) -> None:
+        """Append this rank's new compressed latent to the paged latent cache.
+
+        ``latent`` is this rank's freshly-computed ``[compressed_kv | k_pe]``
+        latent for the current chunk, shape ``(total_new_tokens, 1, D)`` (single
+        latent head, ``kv_factor=1``), concatenated across all requests in the
+        batch.  Delegates to the shared ``append_mla_latent_cache`` helper, which
+        writes each request's new tokens after its cached prefix.
+        """
+        n = metadata.num_seqs
+        seq_lens = metadata.seq_lens.tolist()
+        cached = (
+            metadata.cached_lens_local.tolist()
+            if metadata.cached_lens_local is not None
+            else [0] * n
+        )
+        append_mla_latent_cache(
+            metadata.kv_cache_manager,
+            self.layer_idx,
+            list(metadata.request_ids),
+            seq_lens,
+            cached,
+            latent.reshape(-1, self.head_dim),
+            kv_layout="NHD",
+        )
+
+    def _materialize_latent_from_pages(
+        self,
+        metadata: Attn2DFlashInferAttentionMetadata,
+        req_idx: int,
+        L_local_total: int,
+    ) -> torch.Tensor:
+        """Extract this rank's cached + new latent for one request from cache.
+
+        Mirrors ``_materialize_kv_from_pages`` for the single-latent-head
+        (``kv_factor=1``) MLA cache.  Returns ``(L_local_total, 1, D)`` in
+        absolute-position (per-rank cyclic) order.
+        """
+        D = self.head_dim
+        kv_cache_buf = metadata.kv_cache_manager.get_buffers(self.layer_idx, kv_layout="NHD")
+        if L_local_total == 0:
+            return torch.empty(
+                0, 1, D, dtype=kv_cache_buf.dtype, device=metadata.paged_kv_indices.device
+            )
+        page_size = metadata.kv_cache_manager.tokens_per_block
+        page_start = int(metadata.paged_kv_indptr[req_idx])
+        page_end = int(metadata.paged_kv_indptr[req_idx + 1])
+        num_pages = page_end - page_start
+        last_page_len = int(metadata.paged_kv_last_page_len[req_idx])
+
+        # NHD latent layout: (num_pages_total, 1, page_size, 1, D).  Gather this
+        # request's pages, squeeze the kv_factor axis, flatten (page, slot).
+        page_ids = metadata.paged_kv_indices[page_start:page_end]
+        pages = kv_cache_buf[page_ids]  # (num_pages, 1, page_size, 1, D)
+        flat = pages[:, 0].reshape(num_pages * page_size, 1, D)
+        valid_tokens = (num_pages - 1) * page_size + last_page_len
+        assert valid_tokens == L_local_total, (
+            f"latent page table inconsistent for req {req_idx}: derived "
+            f"{valid_tokens} but expected L_local_total={L_local_total}"
+        )
+        return flat[:L_local_total].contiguous()
 
     def _compute_attention_sorted(
         self,
